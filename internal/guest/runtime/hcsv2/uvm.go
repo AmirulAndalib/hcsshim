@@ -182,7 +182,7 @@ func (h *Host) InjectFragment(ctx context.Context, fragment *guestresource.LCOWS
 
 	unpacked, err := cosesign1.UnpackAndValidateCOSE1CertChain(raw)
 	if err != nil {
-		return fmt.Errorf("InjectFragment failed COSE validation: %s", err.Error())
+		return fmt.Errorf("InjectFragment failed COSE validation: %w", err)
 	}
 
 	payloadString := string(unpacked.Payload[:])
@@ -308,9 +308,9 @@ func (h *Host) CreateContainer(ctx context.Context, id string, settings *prot.VM
 		isSandbox:      criType == "sandbox",
 		exitType:       prot.NtUnexpectedExit,
 		processes:      make(map[uint32]*containerProcess),
-		status:         containerCreating,
 		scratchDirPath: settings.ScratchDirPath,
 	}
+	c.setStatus(containerCreating)
 
 	if err := h.AddContainer(id, c); err != nil {
 		return nil, err
@@ -363,7 +363,7 @@ func (h *Host) CreateContainer(ctx context.Context, id string, settings *prot.VM
 			if !ok || sid == "" {
 				return nil, errors.Errorf("unsupported 'io.kubernetes.cri.sandbox-id': '%s'", sid)
 			}
-			if err := setupWorkloadContainerSpec(ctx, sid, id, settings.OCISpecification); err != nil {
+			if err := setupWorkloadContainerSpec(ctx, sid, id, settings.OCISpecification, settings.OCIBundlePath); err != nil {
 				return nil, err
 			}
 
@@ -543,7 +543,7 @@ func (h *Host) CreateContainer(ctx context.Context, id string, settings *prot.VM
 	return c, nil
 }
 
-func (h *Host) modifyHostSettings(ctx context.Context, containerID string, req *guestrequest.ModificationRequest) (err error) {
+func (h *Host) modifyHostSettings(ctx context.Context, containerID string, req *guestrequest.ModificationRequest) (retErr error) {
 	switch req.ResourceType {
 	case guestresource.ResourceTypeSCSIDevice:
 		return modifySCSIDevice(ctx, req.RequestType, req.Settings.(*guestresource.SCSIDevice))
@@ -551,7 +551,7 @@ func (h *Host) modifyHostSettings(ctx context.Context, containerID string, req *
 		mvd := req.Settings.(*guestresource.LCOWMappedVirtualDisk)
 		// find the actual controller number on the bus and update the incoming request.
 		var cNum uint8
-		cNum, err = scsi.ActualControllerNumber(ctx, mvd.Controller)
+		cNum, err := scsi.ActualControllerNumber(ctx, mvd.Controller)
 		if err != nil {
 			return err
 		}
@@ -569,7 +569,7 @@ func (h *Host) modifyHostSettings(ctx context.Context, containerID string, req *
 					return err
 				}
 				defer func() {
-					if err != nil {
+					if retErr != nil {
 						_ = h.hostMounts.RemoveRWDevice(mvd.MountPath, source)
 					}
 				}()
@@ -578,7 +578,7 @@ func (h *Host) modifyHostSettings(ctx context.Context, containerID string, req *
 					return err
 				}
 				defer func() {
-					if err != nil {
+					if retErr != nil {
 						_ = h.hostMounts.AddRWDevice(mvd.MountPath, source, mvd.Encrypted)
 					}
 				}()
@@ -824,6 +824,9 @@ func (h *Host) GetProperties(ctx context.Context, containerID string, query prot
 			}
 			properties.ProcessList = make([]prot.ProcessDetails, len(pids))
 			for i, pid := range pids {
+				if outOfUint32Bounds(pid) {
+					return nil, errors.Errorf("PID (%d) exceeds uint32 bounds", pid)
+				}
 				properties.ProcessList[i].ProcessID = uint32(pid)
 			}
 		} else if requestedProperty == prot.PtStatistics {
@@ -1005,6 +1008,7 @@ func modifyMappedVirtualDisk(
 				VerityInfo:       verityInfo,
 				EnsureFilesystem: mvd.EnsureFilesystem,
 				Filesystem:       mvd.Filesystem,
+				BlockDev:         mvd.BlockDev,
 			}
 			return scsi.Mount(mountCtx, mvd.Controller, mvd.Lun, mvd.Partition, mvd.MountPath,
 				mvd.ReadOnly, mvd.Options, config)
@@ -1022,6 +1026,7 @@ func modifyMappedVirtualDisk(
 				VerityInfo:       verityInfo,
 				EnsureFilesystem: mvd.EnsureFilesystem,
 				Filesystem:       mvd.Filesystem,
+				BlockDev:         mvd.BlockDev,
 			}
 			if err := scsi.Unmount(ctx, mvd.Controller, mvd.Lun, mvd.Partition,
 				mvd.MountPath, config); err != nil {

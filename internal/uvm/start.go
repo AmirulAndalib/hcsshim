@@ -122,7 +122,7 @@ func parseLogrus(o *Options) OutputHandler {
 }
 
 // When using an external GCS connection it is necessary to send a ModifySettings request
-// for HvSockt so that the GCS can setup some registry keys that are required for running
+// for HvSocket so that the GCS can setup some registry keys that are required for running
 // containers inside the UVM. In non external GCS connection scenarios this is done by the
 // HCS immediately after the GCS connection is done. Since, we are using the external GCS
 // connection we should do that setup here after we connect with the GCS.
@@ -146,7 +146,7 @@ func (uvm *UtilityVM) configureHvSocketForGCS(ctx context.Context) (err error) {
 	}
 
 	if err = uvm.modify(ctx, conSetupReq); err != nil {
-		return fmt.Errorf("failed to configure HVSOCK for external GCS: %s", err)
+		return fmt.Errorf("failed to configure HVSOCK for external GCS: %w", err)
 	}
 
 	return nil
@@ -230,7 +230,7 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 	go func() {
 		// the original context may have timeout or propagate a cancellation
 		// copy the original to prevent it affecting the background wait go routine
-		cCtx := log.Copy(context.Background(), pCtx)
+		cCtx := context.WithoutCancel(pCtx)
 		err := uvm.hcsSystem.WaitCtx(cCtx)
 		if err == nil {
 			err = uvm.hcsSystem.ExitError()
@@ -250,7 +250,7 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 		conn, err := uvm.acceptAndClose(ctx, uvm.gcListener)
 		uvm.gcListener = nil
 		if err != nil {
-			return fmt.Errorf("failed to connect to GCS: %s", err)
+			return fmt.Errorf("failed to connect to GCS: %w", err)
 		}
 
 		var initGuestState *gcs.InitialGuestState
@@ -282,12 +282,12 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 		if err != nil {
 			return err
 		}
-		uvm.guestCaps = *uvm.gc.Capabilities()
+		uvm.guestCaps = uvm.gc.Capabilities()
 		uvm.protocol = uvm.gc.Protocol()
 
 		// initial setup required for external GCS connection
 		if err = uvm.configureHvSocketForGCS(ctx); err != nil {
-			return fmt.Errorf("failed to do initial GCS setup: %s", err)
+			return fmt.Errorf("failed to do initial GCS setup: %w", err)
 		}
 	} else {
 		// Cache the guest connection properties.
@@ -295,7 +295,7 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 		if err != nil {
 			return err
 		}
-		uvm.guestCaps = properties.GuestConnectionInfo.GuestDefinedCapabilities
+		uvm.guestCaps = &gcs.WCOWGuestDefinedCapabilities{GuestDefinedCapabilities: properties.GuestConnectionInfo.GuestDefinedCapabilities}
 		uvm.protocol = properties.GuestConnectionInfo.ProtocolVersion
 	}
 

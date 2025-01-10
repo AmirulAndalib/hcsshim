@@ -11,8 +11,8 @@ import (
 
 	task "github.com/containerd/containerd/api/runtime/task/v2"
 	containerd_v1_types "github.com/containerd/containerd/api/types/task"
-	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/protobuf"
+	"github.com/containerd/errdefs"
 	typeurl "github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
@@ -114,36 +114,6 @@ func (s *service) createInternal(ctx context.Context, req *task.CreateTaskReques
 		if spec.Windows.HyperV == nil {
 			spec.Windows.HyperV = &specs.WindowsHyperV{}
 		}
-	}
-
-	var layerFolders []string
-	if spec.Windows != nil {
-		layerFolders = spec.Windows.LayerFolders
-	}
-	if err := validateRootfsAndLayers(req.Rootfs, layerFolders); err != nil {
-		return nil, err
-	}
-
-	// Only work with Windows here.
-	// Parsing of the rootfs mount for Linux containers occurs later.
-	if spec.Linux == nil && len(req.Rootfs) > 0 {
-		// For Windows containers, we work with LayerFolders throughout
-		// much of the creation logic in the shim. If we were given a
-		// rootfs mount, convert it to LayerFolders here.
-		m := req.Rootfs[0]
-		if m.Type != "windows-layer" {
-			return nil, fmt.Errorf("unsupported Windows mount type: %s", m.Type)
-		}
-
-		source, parentLayerPaths, err := parseLegacyRootfsMount(m)
-		if err != nil {
-			return nil, err
-		}
-
-		// Append the parents
-		spec.Windows.LayerFolders = append(spec.Windows.LayerFolders, parentLayerPaths...)
-		// Append the scratch
-		spec.Windows.LayerFolders = append(spec.Windows.LayerFolders, source)
 	}
 
 	// This is a Windows Argon make sure that we have a Root filled in.

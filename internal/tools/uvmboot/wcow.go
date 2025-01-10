@@ -11,11 +11,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Microsoft/hcsshim/internal/cmd"
-	"github.com/Microsoft/hcsshim/internal/log"
-	"github.com/Microsoft/hcsshim/internal/uvm"
 	"github.com/containerd/console"
 	"github.com/urfave/cli"
+
+	"github.com/Microsoft/hcsshim/internal/cmd"
+	"github.com/Microsoft/hcsshim/internal/layers"
+	"github.com/Microsoft/hcsshim/internal/log"
+	"github.com/Microsoft/hcsshim/internal/uvm"
 )
 
 var (
@@ -54,19 +56,19 @@ var wcowCommand = cli.Command{
 		runMany(c, func(id string) error {
 			options := uvm.NewDefaultOptionsWCOW(id, "")
 			setGlobalOptions(c, options.Options)
-			var layers []string
+			var layerFolders []string
 			if wcowImage != "" {
 				layer, err := filepath.Abs(wcowImage)
 				if err != nil {
 					return err
 				}
-				layers = []string{layer}
+				layerFolders = []string{layer}
 			} else {
 				if wcowDockerImage == "" {
 					wcowDockerImage = "mcr.microsoft.com/windows/nanoserver:1809"
 				}
 				var err error
-				layers, err = getLayers(wcowDockerImage)
+				layerFolders, err = getLayers(wcowDockerImage)
 				if err != nil {
 					return err
 				}
@@ -76,7 +78,11 @@ var wcowCommand = cli.Command{
 				return err
 			}
 			defer os.RemoveAll(tempDir)
-			options.LayerFolders = append(layers, tempDir)
+			layerFolders = append(layerFolders, tempDir)
+			options.BootFiles, err = layers.GetWCOWUVMBootFilesFromLayers(context.TODO(), nil, layerFolders)
+			if err != nil {
+				return err
+			}
 			vm, err := uvm.CreateWCOW(context.TODO(), options)
 			if err != nil {
 				return err
@@ -121,8 +127,8 @@ var wcowCommand = cli.Command{
 }
 
 func getLayers(imageName string) ([]string, error) {
-	cmd := exec.Command("docker", "inspect", imageName, "-f", `"{{.GraphDriver.Data.dir}}"`)
-	out, err := cmd.Output()
+	c := exec.Command("docker", "inspect", imageName, "-f", `"{{.GraphDriver.Data.dir}}"`)
+	out, err := c.Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to find layers for %s", imageName)
 	}
@@ -143,7 +149,7 @@ func getLayerChain(layerFolder string) ([]string, error) {
 	var layerChain []string
 	err = json.Unmarshal(content, &layerChain)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal layerchain: %s", err)
+		return nil, fmt.Errorf("failed to unmarshal layerchain: %w", err)
 	}
 	return layerChain, nil
 }

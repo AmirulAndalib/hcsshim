@@ -4,6 +4,7 @@ package uvm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,9 +27,9 @@ const (
 	vsmbSharePrefix = `\\?\VMSMB\VSMB-{dcc079ae-60ba-4d07-847c-3493609c0870}\`
 )
 
-// VSMBShare contains the host path for a Vsmb Mount
+// VSMBShare contains the host path for a Vsmb Mount.
 type VSMBShare struct {
-	// UVM the resource belongs to
+	// UVM the resource belongs to.
 	vm           *UtilityVM
 	HostPath     string
 	refCount     uint32
@@ -36,12 +37,15 @@ type VSMBShare struct {
 	allowedFiles []string
 	guestPath    string
 	options      hcsschema.VirtualSmbShareOptions
+	// whether the share is mapping an entire directory.
+	// ie, if the share is stored in [vm.vsmbDirShares] or [vm.vsmbFileShares].
+	isDirShare bool
 }
 
 // Release frees the resources of the corresponding vsmb Mount
 func (vsmb *VSMBShare) Release(ctx context.Context) error {
-	if err := vsmb.vm.RemoveVSMB(ctx, vsmb.HostPath, vsmb.options.ReadOnly); err != nil {
-		return fmt.Errorf("failed to remove VSMB share: %s", err)
+	if err := vsmb.vm.removeVSMB(ctx, vsmb.HostPath, vsmb.options.ReadOnly, vsmb.isDirShare); err != nil {
+		return fmt.Errorf("failed to remove VSMB share: %w", err)
 	}
 	return nil
 }
@@ -62,7 +66,7 @@ func (uvm *UtilityVM) DefaultVSMBOptions(readOnly bool) *hcsschema.VirtualSmbSha
 }
 
 // findVSMBShare finds a share by `hostPath`. If not found returns `ErrNotAttached`.
-func (uvm *UtilityVM) findVSMBShare(ctx context.Context, m map[string]*VSMBShare, shareKey string) (*VSMBShare, error) {
+func (*UtilityVM) findVSMBShare(_ context.Context, m map[string]*VSMBShare, shareKey string) (*VSMBShare, error) {
 	share, ok := m[shareKey]
 	if !ok {
 		return nil, ErrNotAttached
@@ -129,7 +133,12 @@ func forceNoDirectMap(path string) (bool, error) {
 	var info winapi.FILE_ID_INFO
 	// We check for any error, rather than just ERROR_INVALID_PARAMETER. It seems better to also
 	// fall back if e.g. some other backing filesystem is used which returns a different error.
-	if err := windows.GetFileInformationByHandleEx(h, winapi.FileIdInfo, (*byte)(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
+	if err := windows.GetFileInformationByHandleEx(
+		h,
+		winapi.FileIdInfo,
+		(*byte)(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+	); err != nil {
 		return true, nil
 	}
 	return false, nil
@@ -181,16 +190,17 @@ func (uvm *UtilityVM) AddVSMB(ctx context.Context, hostPath string, options *hcs
 	var requestType = guestrequest.RequestTypeUpdate
 	shareKey := getVSMBShareKey(hostPath, options.ReadOnly)
 	share, err := uvm.findVSMBShare(ctx, m, shareKey)
-	if err == ErrNotAttached {
+	if errors.Is(err, ErrNotAttached) {
 		requestType = guestrequest.RequestTypeAdd
 		uvm.vsmbCounter++
 		shareName := "s" + strconv.FormatUint(uvm.vsmbCounter, 16)
 
 		share = &VSMBShare{
-			vm:        uvm,
-			name:      shareName,
-			guestPath: vsmbSharePrefix + shareName,
-			HostPath:  hostPath,
+			vm:         uvm,
+			name:       shareName,
+			guestPath:  vsmbSharePrefix + shareName,
+			HostPath:   hostPath,
+			isDirShare: st.IsDir(),
 		}
 	}
 	newAllowedFiles := share.allowedFiles
@@ -234,6 +244,26 @@ func (uvm *UtilityVM) AddVSMB(ctx context.Context, hostPath string, options *hcs
 // RemoveVSMB removes a VSMB share from a utility VM. Each VSMB share is ref-counted
 // and only actually removed when the ref-count drops to zero.
 func (uvm *UtilityVM) RemoveVSMB(ctx context.Context, hostPath string, readOnly bool) error {
+	st, err := os.Stat(hostPath)
+	if err != nil {
+		return err
+	}
+	isDir := st.IsDir()
+	if !isDir {
+		hostPath = filepath.Dir(hostPath)
+	}
+	return uvm.removeVSMB(ctx, hostPath, readOnly, isDir)
+}
+
+// removeVSMB removes the share for the directory at hostPath.
+//
+// directoryShare indicates if the share is stored in [uvm.vsmbDirShares] or [uvm.vsmbFileShares].
+// Ie, it should match [VSMBShare.isDirShare].
+//
+// Regardless of whether the vSMB share is mapping a file or directory, hostPath must be the
+// directory that was shared into the uVM (and the keyname the [VSMBShare] in either
+// [uvm.vsmbDirShares] or [uvm.vsmbFileShares]).
+func (uvm *UtilityVM) removeVSMB(ctx context.Context, hostPath string, readOnly, directoryShare bool) error {
 	if uvm.operatingSystem != "windows" {
 		return errNotSupported
 	}
@@ -241,14 +271,9 @@ func (uvm *UtilityVM) RemoveVSMB(ctx context.Context, hostPath string, readOnly 
 	uvm.m.Lock()
 	defer uvm.m.Unlock()
 
-	st, err := os.Stat(hostPath)
-	if err != nil {
-		return err
-	}
 	m := uvm.vsmbDirShares
-	if !st.IsDir() {
+	if !directoryShare {
 		m = uvm.vsmbFileShares
-		hostPath = filepath.Dir(hostPath)
 	}
 	hostPath = filepath.Clean(hostPath)
 	shareKey := getVSMBShareKey(hostPath, readOnly)
@@ -262,13 +287,31 @@ func (uvm *UtilityVM) RemoveVSMB(ctx context.Context, hostPath string, readOnly 
 		return nil
 	}
 
+	// Cannot remove a directmapped vSMB share without first closing all open handles to the
+	// share files from inside the the uVM (otherwise, the removal would un-map the files from
+	// the uVM's memory and subsequent access's would fail).
+	// Rather than forgetting about the share on the host side, keep it (with refCount == 0)
+	// in case that directory is re-added back for some reason.
+	//
+	// Note: HCS (vmcompute.exe) issues a remove vSMB request to the guest GCS iff:
+	//  - vmwp.exe direct mapped the vSMB share; and
+	//  - the GCS (on its internal bridge) has the PurgeVSmbCachedHandlesSupported capability.
+	// We do not (currently) have the ability to check for either.
+	if !share.options.NoDirectmap {
+		log.G(ctx).WithFields(logrus.Fields{
+			"name": share.name,
+			"path": hostPath,
+		}).Debug("skipping remove of directmapped vSMB share")
+		return nil
+	}
+
 	modification := &hcsschema.ModifySettingRequest{
 		RequestType:  guestrequest.RequestTypeRemove,
 		Settings:     hcsschema.VirtualSmbShare{Name: share.name},
 		ResourcePath: resourcepaths.VSMBShareResourcePath,
 	}
 	if err := uvm.modify(ctx, modification); err != nil {
-		return fmt.Errorf("failed to remove vsmb share %s from %s: %+v: %s", hostPath, uvm.id, modification, err)
+		return fmt.Errorf("failed to remove vsmb share %s from %s: %+v: %w", hostPath, uvm.id, modification, err)
 	}
 
 	delete(m, shareKey)

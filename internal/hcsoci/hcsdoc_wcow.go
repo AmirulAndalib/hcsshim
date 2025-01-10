@@ -20,13 +20,11 @@ import (
 	"github.com/Microsoft/hcsshim/internal/guestpath"
 	"github.com/Microsoft/hcsshim/internal/hcs/schema1"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
-	"github.com/Microsoft/hcsshim/internal/layers"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/oci"
 	"github.com/Microsoft/hcsshim/internal/processorinfo"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 	"github.com/Microsoft/hcsshim/internal/uvmfolder"
-	"github.com/Microsoft/hcsshim/internal/wclayer"
 	"github.com/Microsoft/hcsshim/osversion"
 	"github.com/Microsoft/hcsshim/pkg/annotations"
 )
@@ -67,7 +65,7 @@ func createMountsConfig(ctx context.Context, coi *createOptionsInternal) (*mount
 				// about the isolated case.
 				src, err := fs.ResolvePath(mount.Source)
 				if err != nil {
-					return nil, fmt.Errorf("failed to resolve path for mount source %q: %s", mount.Source, err)
+					return nil, fmt.Errorf("failed to resolve path for mount source %q: %w", mount.Source, err)
 				}
 				mdv2.HostPath = src
 			} else if mount.Type == MountTypeVirtualDisk || mount.Type == MountTypePhysicalDisk || mount.Type == MountTypeExtensibleVirtualDisk {
@@ -162,11 +160,6 @@ func createWindowsContainerDocument(ctx context.Context, coi *createOptionsInter
 	// ID is a property on the create call in V2 rather than part of the schema.
 	v2Container := &hcsschema.Container{Storage: &hcsschema.Storage{}}
 
-	// TODO: Still want to revisit this.
-	if coi.Spec.Windows.LayerFolders == nil || len(coi.Spec.Windows.LayerFolders) < 2 {
-		return nil, nil, fmt.Errorf("invalid spec - not enough layer folders supplied")
-	}
-
 	if coi.Spec.Hostname != "" {
 		v1.HostName = coi.Spec.Hostname
 		v2Container.GuestOs = &hcsschema.GuestOs{HostName: coi.Spec.Hostname}
@@ -245,7 +238,16 @@ func createWindowsContainerDocument(ctx context.Context, coi *createOptionsInter
 	// Memory Resources
 	memoryMaxInMB := oci.ParseAnnotationsMemory(ctx, coi.Spec, annotations.ContainerMemorySizeInMB, 0)
 	if memoryMaxInMB > 0 {
-		v1.MemoryMaximumInMB = int64(memoryMaxInMB)
+		if memoryMaxInMB > math.MaxInt64 {
+			v1.MemoryMaximumInMB = math.MaxInt64
+			log.G(ctx).WithFields(logrus.Fields{
+				"annotation":       annotations.ContainerMemorySizeInMB,
+				"oldMemoryMaxInMB": memoryMaxInMB,
+				"newMemoryMaxInMB": v1.MemoryMaximumInMB,
+			}).Debug("container memory size limit exceeds maximum value allowed in v1 HCS schema")
+		} else {
+			v1.MemoryMaximumInMB = int64(memoryMaxInMB)
+		}
 		v2Container.Memory = &hcsschema.Memory{
 			SizeInMB: memoryMaxInMB,
 		}
@@ -302,7 +304,8 @@ func createWindowsContainerDocument(ctx context.Context, coi *createOptionsInter
 	}
 
 	// Strip off the top-most RW/scratch layer as that's passed in separately to HCS for v1
-	v1.LayerFolderPath = coi.Spec.Windows.LayerFolders[len(coi.Spec.Windows.LayerFolders)-1]
+	// TODO(ambarve) Understand how this path is exactly used and fix it.
+	// v1.LayerFolderPath = coi.Spec.Windows.LayerFolders[len(coi.Spec.Windows.LayerFolders)-1]
 
 	if coi.isV2Argon() || coi.isV1Argon() {
 		// Argon v1 or v2.
@@ -326,7 +329,14 @@ func createWindowsContainerDocument(ctx context.Context, coi *createOptionsInter
 			v1.HvRuntime = &schema1.HvRuntime{ImagePath: coi.Spec.Windows.HyperV.UtilityVMPath}
 		} else {
 			// Client was lazy. Let's locate it from the layer folders instead.
-			uvmImagePath, err := uvmfolder.LocateUVMFolder(ctx, coi.Spec.Windows.LayerFolders)
+			// We are using v1xenon so we can't be using CimFS layers, that
+			// means mounted layers has to have individual layer directory
+			// paths that can be passed here.
+			layerFolders := []string{}
+			for _, ml := range coi.mountedWCOWLayers.MountedLayerPaths {
+				layerFolders = append(layerFolders, ml.MountedPath)
+			}
+			uvmImagePath, err := uvmfolder.LocateUVMFolder(ctx, layerFolders)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -336,22 +346,24 @@ func createWindowsContainerDocument(ctx context.Context, coi *createOptionsInter
 		// Hosting system was supplied, so is v2 Xenon.
 		v2Container.Storage.Path = coi.Spec.Root.Path
 		if coi.HostingSystem.OS() == "windows" {
-			layers, err := layers.GetHCSLayers(ctx, coi.HostingSystem, coi.Spec.Windows.LayerFolders[:len(coi.Spec.Windows.LayerFolders)-1])
-			if err != nil {
-				return nil, nil, err
+			layers := []hcsschema.Layer{}
+			for _, ml := range coi.mountedWCOWLayers.MountedLayerPaths {
+				layers = append(layers, hcsschema.Layer{
+					Id:   ml.LayerID,
+					Path: ml.MountedPath,
+				})
 			}
 			v2Container.Storage.Layers = layers
 		}
 	}
 
 	if coi.isV2Argon() || coi.isV1Argon() { // Argon v1 or v2
-		for _, layerPath := range coi.Spec.Windows.LayerFolders[:len(coi.Spec.Windows.LayerFolders)-1] {
-			layerID, err := wclayer.LayerID(ctx, layerPath)
-			if err != nil {
-				return nil, nil, err
-			}
-			v1.Layers = append(v1.Layers, schema1.Layer{ID: layerID.String(), Path: layerPath})
-			v2Container.Storage.Layers = append(v2Container.Storage.Layers, hcsschema.Layer{Id: layerID.String(), Path: layerPath})
+		for _, ml := range coi.mountedWCOWLayers.MountedLayerPaths {
+			v1.Layers = append(v1.Layers, schema1.Layer{ID: ml.LayerID, Path: ml.MountedPath})
+			v2Container.Storage.Layers = append(v2Container.Storage.Layers, hcsschema.Layer{
+				Id:   ml.LayerID,
+				Path: ml.MountedPath,
+			})
 		}
 	}
 
@@ -408,12 +420,12 @@ func createWindowsContainerDocument(ctx context.Context, coi *createOptionsInter
 	registryAdd := []hcsschema.RegistryValue{
 		{
 			Key: &hcsschema.RegistryKey{
-				Hive: "System",
+				Hive: hcsschema.RegistryHive_SYSTEM,
 				Name: "ControlSet001\\Control",
 			},
 			Name:        "WaitToKillServiceTimeout",
 			StringValue: strconv.Itoa(math.MaxInt32),
-			Type_:       "String",
+			Type_:       hcsschema.RegistryValueType_STRING,
 		},
 	}
 
@@ -444,21 +456,21 @@ func createWindowsContainerDocument(ctx context.Context, coi *createOptionsInter
 		registryAdd = append(registryAdd, []hcsschema.RegistryValue{
 			{
 				Key: &hcsschema.RegistryKey{
-					Hive: "Software",
+					Hive: hcsschema.RegistryHive_SOFTWARE,
 					Name: "Microsoft\\Windows\\Windows Error Reporting\\LocalDumps",
 				},
 				Name:        "DumpFolder",
 				StringValue: dumpPath,
-				Type_:       "String",
+				Type_:       hcsschema.RegistryValueType_STRING,
 			},
 			{
 				Key: &hcsschema.RegistryKey{
-					Hive: "Software",
+					Hive: hcsschema.RegistryHive_SOFTWARE,
 					Name: "Microsoft\\Windows\\Windows Error Reporting\\LocalDumps",
 				},
 				Name:       "DumpType",
 				DWordValue: dumpType,
-				Type_:      "DWord",
+				Type_:      hcsschema.RegistryValueType_D_WORD,
 			},
 			{
 				Key: &hcsschema.RegistryKey{
@@ -479,7 +491,7 @@ func createWindowsContainerDocument(ctx context.Context, coi *createOptionsInter
 }
 
 // parseAssignedDevices parses assigned devices for the container definition
-// this is currently supported for v2 argon and xenon only
+// this is currently supported for v2 argon and xenon only.
 func parseAssignedDevices(ctx context.Context, coi *createOptionsInternal, v2 *hcsschema.Container) error {
 	if !coi.isV2Argon() && !coi.isV2Xenon() {
 		return nil
@@ -513,7 +525,7 @@ func parseDumpCount(annots map[string]string) (int32, error) {
 		return 10, nil
 	}
 
-	dumpCount, err := strconv.Atoi(dmpCountStr)
+	dumpCount, err := strconv.ParseInt(dmpCountStr, 10, 32)
 	if err != nil {
 		return -1, err
 	}
@@ -526,7 +538,7 @@ func parseDumpCount(annots map[string]string) (int32, error) {
 // parseDumpType parses the passed in string representation of the local user mode process dump type to the
 // corresponding value the registry expects to be set.
 //
-// See DumpType at https://docs.microsoft.com/en-us/windows/win32/wer/collecting-user-mode-dumps for the mappings
+// See DumpType at https://docs.microsoft.com/en-us/windows/win32/wer/collecting-user-mode-dumps for the mappings.
 func parseDumpType(annots map[string]string) (int32, error) {
 	dmpTypeStr := annots[annotations.WCOWProcessDumpType]
 	switch dmpTypeStr {

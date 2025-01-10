@@ -6,7 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"io"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -14,13 +14,12 @@ import (
 
 	"github.com/Microsoft/go-winio"
 	"github.com/Microsoft/go-winio/pkg/guid"
-	"github.com/Microsoft/hcsshim/internal/security"
-	"github.com/Microsoft/hcsshim/internal/uvm/scsi"
 	"github.com/Microsoft/hcsshim/pkg/securitypolicy"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"go.opencensus.io/trace"
 
+	"github.com/Microsoft/hcsshim/internal/copyfile"
 	"github.com/Microsoft/hcsshim/internal/gcs"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/log"
@@ -29,6 +28,8 @@ import (
 	"github.com/Microsoft/hcsshim/internal/processorinfo"
 	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
 	"github.com/Microsoft/hcsshim/internal/schemaversion"
+	"github.com/Microsoft/hcsshim/internal/security"
+	"github.com/Microsoft/hcsshim/internal/uvm/scsi"
 	"github.com/Microsoft/hcsshim/osversion"
 )
 
@@ -68,14 +69,20 @@ const (
 	InitrdFile = "initrd.img"
 	// VhdFile is the default file name for a rootfs.vhd used to boot LCOW.
 	VhdFile = "rootfs.vhd"
+	// DefaultDmVerityRootfsVhd is the default file name for a dmverity_rootfs.vhd,
+	// which is mounted by the GuestStateFile during boot and used as the root file
+	// system when booting in the SNP case. Similar to layer VHDs, the Merkle tree
+	// is appended after ext4 filesystem ends.
+	DefaultDmVerityRootfsVhd = "rootfs.vhd"
 	// KernelFile is the default file name for a kernel used to boot LCOW.
 	KernelFile = "kernel"
 	// UncompressedKernelFile is the default file name for an uncompressed
 	// kernel used to boot LCOW with KernelDirect.
 	UncompressedKernelFile = "vmlinux"
 	// GuestStateFile is the default file name for a vmgs (VM Guest State) file
-	// which combines kernel and initrd and is used to boot from in the SNP case.
-	GuestStateFile = "kernelinitrd.vmgs"
+	// which contains the kernel and kernel command which mounts DmVerityVhdFile
+	// when booting in the SNP case.
+	GuestStateFile = "kernel.vmgs"
 	// UVMReferenceInfoFile is the default file name for a COSE_Sign1
 	// reference UVM info, which can be made available to workload containers
 	// and can be used for validation purposes.
@@ -90,6 +97,9 @@ type ConfidentialOptions struct {
 	SecurityPolicyEnforcer string // Set which security policy enforcer to use (open door, standard or rego). This allows for better fallback mechanic.
 	UVMReferenceInfoFile   string // Filename under `BootFilesPath` for (potentially signed) UVM image reference information.
 	BundleDirectory        string // pod bundle directory
+	DmVerityRootFsVhd      string // The VHD file (bound to the vmgs file via embedded dmverity hash data file) to load.
+	DmVerityMode           bool   // override to be able to turn off dmverity for debugging
+	DmVerityCreateArgs     string // set dm-verity args when booting with verity in non-SNP mode
 }
 
 // OptionsLCOW are the set of options passed to CreateLCOW() to create a utility vm.
@@ -121,6 +131,8 @@ type OptionsLCOW struct {
 	EnableScratchEncryption bool                 // Whether the scratch should be encrypted
 	DisableTimeSyncService  bool                 // Disables the time synchronization service
 	HclEnabled              *bool                // Whether to enable the host compatibility layer
+	ExtraVSockPorts         []uint32             // Extra vsock ports to allow
+	AssignedDevices         []VPCIDeviceID       // AssignedDevices are devices to add on pod boot
 }
 
 // defaultLCOWOSBootFilesPath returns the default path used to locate the LCOW
@@ -228,20 +240,20 @@ func (opts *OptionsLCOW) UpdateBootFilesPath(ctx context.Context, path string) {
 }
 
 // Get an acceptable number of processors given option and actual constraints.
-func fetchProcessor(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (*hcsschema.Processor2, error) {
+func fetchProcessor(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (*hcsschema.VirtualMachineProcessor, error) {
 	processorTopology, err := processorinfo.HostProcessorInfo(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get host processor information: %s", err)
+		return nil, fmt.Errorf("failed to get host processor information: %w", err)
 	}
 
 	// To maintain compatibility with Docker we need to automatically downgrade
 	// a user CPU count if the setting is not possible.
 	uvm.processorCount = uvm.normalizeProcessorCount(ctx, opts.ProcessorCount, processorTopology)
 
-	processor := &hcsschema.Processor2{
-		Count:  uvm.processorCount,
-		Limit:  opts.ProcessorLimit,
-		Weight: opts.ProcessorWeight,
+	processor := &hcsschema.VirtualMachineProcessor{
+		Count:  uint32(uvm.processorCount),
+		Limit:  uint64(opts.ProcessorLimit),
+		Weight: uint64(opts.ProcessorWeight),
 	}
 	// We can set a cpu group for the VM at creation time in recent builds.
 	if opts.CPUGroupID != "" {
@@ -332,51 +344,58 @@ Example JSON document produced once the hcsschema.ComputeSytem returned by makeL
 // A large part of difference between the SNP case and the usual kernel+option+initrd case is to do with booting
 // from a VMGS file. The VMGS part may be used other than with SNP so is split out here.
 
-// Make a hcsschema.ComputeSytem with the parts that target booting from a VMGS file
+// Make a hcsschema.ComputeSytem with the parts that target booting from a VMGS file.
 func makeLCOWVMGSDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ *hcsschema.ComputeSystem, err error) {
-	// Kernel and initrd are combined into a single vmgs file.
+	// Raise an error if instructed to use a particular sort of rootfs.
+	if opts.PreferredRootFSType != PreferredRootFSTypeNA {
+		return nil, errors.New("specifying a PreferredRootFSType is incompatible with SNP mode")
+	}
+
+	// The kernel and minimal initrd are combined into a single vmgs file.
 	vmgsTemplatePath := filepath.Join(opts.BootFilesPath, opts.GuestStateFile)
 	if _, err := os.Stat(vmgsTemplatePath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("the GuestState vmgs file '%s' was not found", vmgsTemplatePath)
 	}
 
-	// The rootfs must be provided as an initrd within the VMGS file.
-	// Raise an error if instructed to use a particular sort of rootfs.
-	if opts.PreferredRootFSType != PreferredRootFSTypeNA {
-		return nil, fmt.Errorf("cannot override rootfs when using VMGS file")
+	// The root file system comes from the dmverity vhd file which is mounted by the initrd in the vmgs file.
+	dmVerityRootfsTemplatePath := filepath.Join(opts.BootFilesPath, opts.DmVerityRootFsVhd)
+	if _, err := os.Stat(dmVerityRootfsTemplatePath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("the DM Verity VHD file '%s' was not found", dmVerityRootfsTemplatePath)
 	}
 
-	var processor *hcsschema.Processor2
+	var processor *hcsschema.VirtualMachineProcessor
 	processor, err = fetchProcessor(ctx, opts, uvm)
 	if err != nil {
 		return nil, err
 	}
 
-	vmgsFile, err := os.Create(filepath.Join(opts.BundleDirectory, opts.GuestStateFile))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temporary VMGS file: %w", err)
+	vmgsFileFullPath := filepath.Join(opts.BundleDirectory, opts.GuestStateFile)
+	if err := copyfile.CopyFile(ctx, vmgsTemplatePath, vmgsFileFullPath, true); err != nil {
+		return nil, fmt.Errorf("failed to copy VMGS template file: %w", err)
 	}
 	defer func() {
-		_ = vmgsFile.Close()
 		if err != nil {
-			if rmErr := os.RemoveAll(vmgsFile.Name()); rmErr != nil {
-				log.G(ctx).WithError(rmErr).Error("failed to remove temporary VMGS file")
-			}
+			os.Remove(vmgsFileFullPath)
 		}
 	}()
 
-	templateFile, err := os.Open(vmgsTemplatePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open template VMGS file for copy: %w", err)
+	dmVerityRootFsFullPath := filepath.Join(opts.BundleDirectory, DefaultDmVerityRootfsVhd)
+	if err := copyfile.CopyFile(ctx, dmVerityRootfsTemplatePath, dmVerityRootFsFullPath, true); err != nil {
+		return nil, fmt.Errorf("failed to copy DM Verity rootfs template file: %w", err)
 	}
-	defer templateFile.Close()
+	defer func() {
+		if err != nil {
+			os.Remove(dmVerityRootFsFullPath)
+		}
+	}()
 
-	if _, err := io.Copy(vmgsFile, templateFile); err != nil {
-		return nil, fmt.Errorf("failed to copy template VMGS file: %w", err)
-	}
-
-	if err := security.GrantVmGroupAccessWithMask(vmgsFile.Name(), security.AccessMaskAll); err != nil {
-		return nil, fmt.Errorf("failed to grant VM group access ALL: %w", err)
+	for _, filename := range []string{
+		vmgsFileFullPath,
+		dmVerityRootFsFullPath,
+	} {
+		if err := security.GrantVmGroupAccessWithMask(filename, security.AccessMaskAll); err != nil {
+			return nil, fmt.Errorf("failed to grant VM group access ALL: %w", err)
+		}
 	}
 
 	// Align the requested memory size.
@@ -390,7 +409,7 @@ func makeLCOWVMGSDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ 
 			StopOnReset: true,
 			Chipset:     &hcsschema.Chipset{},
 			ComputeTopology: &hcsschema.Topology{
-				Memory: &hcsschema.Memory2{
+				Memory: &hcsschema.VirtualMachineMemory{
 					SizeInMB:              memorySizeInMB,
 					AllowOvercommit:       opts.AllowOvercommit,
 					EnableDeferredCommit:  opts.EnableDeferredCommit,
@@ -416,13 +435,16 @@ func makeLCOWVMGSDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ 
 		},
 	}
 
+	maps.Copy(doc.VirtualMachine.Devices.HvSocket.HvSocketConfig.ServiceTable, opts.AdditionalHyperVConfig)
+
 	// Set permissions for the VSock ports:
 	//		entropyVsockPort - 1 is the entropy port,
 	//		linuxLogVsockPort - 109 used by vsockexec to log stdout/stderr logging,
 	//		0x40000000 + 1 (LinuxGcsVsockPort + 1) is the bridge (see guestconnectiuon.go)
-	hvSockets := [...]uint32{entropyVsockPort, linuxLogVsockPort, gcs.LinuxGcsVsockPort, gcs.LinuxGcsVsockPort + 1}
+	hvSockets := []uint32{entropyVsockPort, linuxLogVsockPort, gcs.LinuxGcsVsockPort, gcs.LinuxGcsVsockPort + 1}
+	hvSockets = append(hvSockets, opts.ExtraVSockPorts...)
 	for _, whichSocket := range hvSockets {
-		key := fmt.Sprintf("%08x-facb-11e6-bd58-64006a7986d3", whichSocket) // format of a linux hvsock GUID is port#-facb-11e6-bd58-64006a7986d3
+		key := winio.VsockServiceID(whichSocket).String()
 		doc.VirtualMachine.Devices.HvSocket.HvSocketConfig.ServiceTable[key] = hcsschema.HvSocketServiceConfig{
 			AllowWildcardBinds:        true,
 			BindSecurityDescriptor:    "D:P(A;;FA;;;WD)",
@@ -439,11 +461,22 @@ func makeLCOWVMGSDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ 
 	}
 
 	if uvm.scsiControllerCount > 0 {
+		logrus.Debug("makeLCOWVMGSDoc configuring scsi devices")
 		doc.VirtualMachine.Devices.Scsi = map[string]hcsschema.Scsi{}
 		for i := 0; i < int(uvm.scsiControllerCount); i++ {
 			doc.VirtualMachine.Devices.Scsi[guestrequest.ScsiControllerGuids[i]] = hcsschema.Scsi{
 				Attachments: make(map[string]hcsschema.Attachment),
 			}
+		}
+		if opts.DmVerityMode {
+			logrus.Debug("makeLCOWVMGSDoc DmVerityMode true")
+			scsiController0 := guestrequest.ScsiControllerGuids[0]
+			doc.VirtualMachine.Devices.Scsi[scsiController0].Attachments["0"] = hcsschema.Attachment{
+				Type_:    "VirtualDisk",
+				Path:     dmVerityRootFsFullPath,
+				ReadOnly: true,
+			}
+			uvm.reservedSCSISlots = append(uvm.reservedSCSISlots, scsi.Slot{Controller: 0, LUN: 0})
 		}
 	}
 
@@ -457,7 +490,7 @@ func makeLCOWVMGSDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ 
 
 	// Point at the file that contains the linux kernel and initrd images.
 	doc.VirtualMachine.GuestState = &hcsschema.GuestState{
-		GuestStateFilePath:  vmgsFile.Name(),
+		GuestStateFilePath:  vmgsFileFullPath,
 		GuestStateFileType:  "FileMode",
 		ForceTransientState: true, // tell HCS that this is just the source of the images, not ongoing state
 	}
@@ -560,14 +593,32 @@ func makeLCOWDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ *hcs
 		return nil, fmt.Errorf("boot file: '%s' not found", rootfsFullPath)
 	}
 
-	var processor *hcsschema.Processor2
+	var processor *hcsschema.VirtualMachineProcessor
 	processor, err = fetchProcessor(ctx, opts, uvm) // must happen after the file existence tests above.
+	if err != nil {
+		return nil, err
+	}
+
+	numa, numaProcessors, err := prepareVNumaTopology(opts.Options)
 	if err != nil {
 		return nil, err
 	}
 
 	// Align the requested memory size.
 	memorySizeInMB := uvm.normalizeMemorySize(ctx, opts.MemorySizeInMB)
+
+	if numa != nil {
+		if opts.AllowOvercommit {
+			return nil, fmt.Errorf("vNUMA supports only Physical memory backing type")
+		}
+		if err := validateNumaForVM(numa, processor.Count, memorySizeInMB); err != nil {
+			return nil, fmt.Errorf("failed to validate vNUMA settings: %w", err)
+		}
+	}
+
+	if numaProcessors != nil {
+		processor.NumaProcessorsSettings = numaProcessors
+	}
 
 	doc := &hcsschema.ComputeSystem{
 		Owner:                             uvm.owner,
@@ -577,7 +628,7 @@ func makeLCOWDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ *hcs
 			StopOnReset: true,
 			Chipset:     &hcsschema.Chipset{},
 			ComputeTopology: &hcsschema.Topology{
-				Memory: &hcsschema.Memory2{
+				Memory: &hcsschema.VirtualMachineMemory{
 					SizeInMB:              memorySizeInMB,
 					AllowOvercommit:       opts.AllowOvercommit,
 					EnableDeferredCommit:  opts.EnableDeferredCommit,
@@ -587,6 +638,7 @@ func makeLCOWDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ *hcs
 					HighMMIOGapInMB:       opts.HighMMIOGapInMB,
 				},
 				Processor: processor,
+				Numa:      numa,
 			},
 			Devices: &hcsschema.Devices{
 				HvSocket: &hcsschema.HvSocket2{
@@ -594,12 +646,65 @@ func makeLCOWDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ *hcs
 						// Allow administrators and SYSTEM to bind to vsock sockets
 						// so that we can create a GCS log socket.
 						DefaultBindSecurityDescriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)",
+						ServiceTable:                  make(map[string]hcsschema.HvSocketServiceConfig),
 					},
 				},
 				Plan9: &hcsschema.Plan9{},
 			},
 		},
 	}
+
+	// Expose ACPI information into UVM
+	if numa != nil || numaProcessors != nil {
+		firmwareFallbackMeasured := hcsschema.VirtualSlitType_FIRMWARE_FALLBACK_MEASURED
+		doc.VirtualMachine.ComputeTopology.Memory.SlitType = &firmwareFallbackMeasured
+	}
+
+	// Add optional devices that were specified on the UVM spec
+	if len(opts.AssignedDevices) > 0 {
+		if doc.VirtualMachine.Devices.VirtualPci == nil {
+			doc.VirtualMachine.Devices.VirtualPci = make(map[string]hcsschema.VirtualPciDevice)
+		}
+		for _, d := range opts.AssignedDevices {
+			// we don't need to hold the modify lock here because the UVM has
+			// not yet been created.
+			existingDevice := uvm.vpciDevices[d]
+			if existingDevice != nil {
+				return nil, fmt.Errorf("device %s with index %d is specified multiple times", d.deviceInstanceID, d.virtualFunctionIndex)
+			}
+
+			vmbusGUID, err := guid.NewV4()
+			if err != nil {
+				return nil, err
+			}
+
+			var propagateAffinity *bool
+			T := true
+			if osversion.Get().Build >= osversion.V25H1Server && (numa != nil || numaProcessors != nil) {
+				propagateAffinity = &T
+			}
+			doc.VirtualMachine.Devices.VirtualPci[vmbusGUID.String()] = hcsschema.VirtualPciDevice{
+				Functions: []hcsschema.VirtualPciFunction{
+					{
+						DeviceInstancePath: d.deviceInstanceID,
+						VirtualFunction:    d.virtualFunctionIndex,
+					},
+				},
+				PropagateNumaAffinity: propagateAffinity,
+			}
+
+			device := &VPCIDevice{
+				vm:                   uvm,
+				VMBusGUID:            vmbusGUID.String(),
+				deviceInstanceID:     d.deviceInstanceID,
+				virtualFunctionIndex: d.virtualFunctionIndex,
+				refCount:             1,
+			}
+			uvm.vpciDevices[d] = device
+		}
+	}
+
+	maps.Copy(doc.VirtualMachine.Devices.HvSocket.HvSocketConfig.ServiceTable, opts.AdditionalHyperVConfig)
 
 	// Handle StorageQoS if set
 	if opts.StorageQoSBandwidthMaximum > 0 || opts.StorageQoSIopsMaximum > 0 {
@@ -678,6 +783,12 @@ func makeLCOWDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ *hcs
 			}
 		} else {
 			kernelArgs = "root=/dev/sda ro rootwait init=/init"
+			if opts.DmVerityMode {
+				if len(opts.DmVerityCreateArgs) == 0 {
+					return nil, errors.New("DmVerityCreateArgs must be set when DmVerityMode is true and not booting from a vmgs file.")
+				}
+				kernelArgs = fmt.Sprintf("root=/dev/dm-0 dm-mod.create=%q init=/init", opts.DmVerityCreateArgs)
+			}
 			doc.VirtualMachine.Devices.Scsi[guestrequest.ScsiControllerGuids[0]].Attachments["0"] = hcsschema.Attachment{
 				Type_:    "VirtualDisk",
 				Path:     rootfsFullPath,
@@ -812,7 +923,7 @@ func CreateLCOW(ctx context.Context, opts *OptionsLCOW) (_ *UtilityVM, err error
 		scsiControllerCount:     opts.SCSIControllerCount,
 		vpmemMaxCount:           opts.VPMemDeviceCount,
 		vpmemMaxSizeBytes:       opts.VPMemSizeBytes,
-		vpciDevices:             make(map[VPCIDeviceKey]*VPCIDevice),
+		vpciDevices:             make(map[VPCIDeviceID]*VPCIDevice),
 		physicallyBacked:        !opts.AllowOvercommit,
 		devicesPhysicallyBacked: opts.FullyPhysicallyBacked,
 		createOpts:              opts,

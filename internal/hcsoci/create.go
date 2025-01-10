@@ -45,6 +45,7 @@ type CreateOptions struct {
 	HostingSystem    *uvm.UtilityVM     // Utility or service VM in which the container is to be created.
 	NetworkNamespace string             // Host network namespace to use (overrides anything in the spec)
 	LCOWLayers       *layers.LCOWLayers
+	WCOWLayers       layers.WCOWLayers
 
 	// This is an advanced debugging parameter. It allows for diagnosability by leaving a containers
 	// resources allocated in case of a failure. Thus you would be able to use tools such as hcsdiag
@@ -70,6 +71,8 @@ type createOptionsInternal struct {
 	ccgState               *hcsschema.ContainerCredentialGuardState // Container Credential Guard information to be attached to HCS container document
 
 	windowsAdditionalMounts []hcsschema.MappedDirectory // Holds additional mounts based on added devices (such as SCSI). Only used for Windows v2 schema containers.
+
+	mountedWCOWLayers *layers.MountedWCOWLayers
 }
 
 func validateContainerConfig(ctx context.Context, coi *createOptionsInternal) error {
@@ -143,7 +146,7 @@ func configureSandboxNetwork(ctx context.Context, coi *createOptionsInternal, r 
 			if err := coi.HostingSystem.ConfigureNetworking(ctx, coi.actualNetworkNamespace); err != nil {
 				// No network setup type was specified for this UVM. Create and assign one here unless
 				// we received a different error.
-				if err == uvm.ErrNoNetworkSetup {
+				if errors.Is(err, uvm.ErrNoNetworkSetup) {
 					if err := coi.HostingSystem.CreateAndAssignNetworkSetup(ctx, "", ""); err != nil {
 						return err
 					}
@@ -174,7 +177,7 @@ func CreateContainer(ctx context.Context, createOptions *CreateOptions) (_ cow.C
 	}
 
 	if err := validateContainerConfig(ctx, coi); err != nil {
-		return nil, nil, fmt.Errorf("container config validation failed: %s", err)
+		return nil, nil, fmt.Errorf("container config validation failed: %w", err)
 	}
 
 	r := resources.NewContainerResources(coi.ID)
@@ -215,7 +218,7 @@ func CreateContainer(ctx context.Context, createOptions *CreateOptions) (_ cow.C
 		schemaversion.IsV21(coi.actualSchemaVersion) {
 		err = configureSandboxNetwork(ctx, coi, r, ct)
 		if err != nil {
-			return nil, r, fmt.Errorf("failure while creating namespace for container: %s", err)
+			return nil, r, fmt.Errorf("failure while creating namespace for container: %w", err)
 		}
 	}
 

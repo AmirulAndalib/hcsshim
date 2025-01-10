@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"sync"
 	"syscall"
@@ -19,11 +18,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/windows"
 )
-
-func init() {
-	// Need to seed for the rng in backoff.NextBackoff()
-	rand.Seed(time.Now().UnixNano())
-}
 
 // NewNpipeIO creates connected upstream io. It is the callers responsibility to validate that `if terminal == true`, `stderr == ""`. retryTimeout
 // refers to the timeout used to try and reconnect to the server end of the named pipe if the connection is severed. A value of 0 for retryTimeout
@@ -163,7 +157,7 @@ func (nprw *nPipeRetryWriter) retryDialPipe() (net.Conn, error) {
 // isDisconnectedErr is a helper to determine if the error received from writing to the server end of a named pipe indicates a disconnect/severed
 // connection. This can be used to attempt a redial if it's expected that the server will come back online at some point.
 func isDisconnectedErr(err error) bool {
-	if serr, ok := err.(syscall.Errno); ok {
+	if serr, ok := err.(syscall.Errno); ok { //nolint:errorlint
 		// Server went away/something went wrong.
 		return serr == windows.ERROR_NO_DATA || serr == windows.ERROR_PIPE_NOT_CONNECTED || serr == windows.ERROR_BROKEN_PIPE
 	}

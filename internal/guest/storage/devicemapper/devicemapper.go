@@ -30,6 +30,7 @@ const (
 var (
 	removeDeviceWrapper = removeDevice
 	openMapperWrapper   = openMapper
+	_createDevice       = CreateDevice
 )
 
 //nolint:stylecheck // ST1003: ALL_CAPS
@@ -229,13 +230,13 @@ func CreateDeviceWithRetryErrors(
 ) (string, error) {
 retry:
 	for {
-		dmPath, err := CreateDevice(name, flags, targets)
+		dmPath, err := _createDevice(name, flags, targets)
 		if err == nil {
 			return dmPath, nil
 		}
 		log.G(ctx).WithError(err).Warning("CreateDevice error")
 		// In some cases
-		dmErr, ok := err.(*dmError)
+		dmErr, ok := err.(*dmError) //nolint:errorlint // explicitly returned
 		if !ok {
 			return "", err
 		}
@@ -244,7 +245,7 @@ retry:
 			if errors.Is(dmErr.Err, e) {
 				select {
 				case <-ctx.Done():
-					log.G(ctx).WithError(err).Warning("CreateDeviceWithRetryErrors failed, context timeout")
+					log.G(ctx).WithError(err).Error("CreateDeviceWithRetryErrors failed, context timeout")
 					return "", err
 				default:
 					time.Sleep(100 * time.Millisecond)
@@ -320,7 +321,7 @@ func RemoveDevice(name string) (err error) {
 	// target has been unmounted.
 	for i := 0; i < 10; i++ {
 		if err = rm(); err != nil {
-			if e, ok := err.(*dmError); !ok || e.Err != syscall.EBUSY { //nolint:errorlint
+			if e, ok := err.(*dmError); !ok || !errors.Is(e.Err, syscall.EBUSY) { //nolint:errorlint // explicitly returned
 				break
 			}
 			time.Sleep(10 * time.Millisecond)

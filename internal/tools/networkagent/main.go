@@ -19,6 +19,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	crypto "crypto/rand"
+
 	"github.com/Microsoft/hcsshim/hcn"
 	"github.com/Microsoft/hcsshim/internal/log"
 	ncproxygrpc "github.com/Microsoft/hcsshim/pkg/ncproxy/ncproxygrpc/v1"
@@ -39,7 +41,7 @@ const (
 func generateMAC() (string, error) {
 	buf := make([]byte, 6)
 
-	_, err := rand.Read(buf)
+	_, err := crypto.Read(buf)
 	if err != nil {
 		return "", err
 	}
@@ -351,7 +353,7 @@ func (s *service) addHelper(ctx context.Context, req *nodenetsvc.ConfigureNetwor
 			// add endpoints that are in the namespace as NICs
 			nicID, err := guid.NewV4()
 			if err != nil {
-				return nil, fmt.Errorf("failed to create nic GUID: %s", err)
+				return nil, fmt.Errorf("failed to create nic GUID: %w", err)
 			}
 			endpointName := ""
 			switch ep := endpoint.Endpoint.GetSettings().(type) {
@@ -475,6 +477,8 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigChan)
 
+	// TODO: replace with grpc.NewClient
+	//nolint:staticcheck // SA1019: grpc.Dial is deprecated, replace with grpc.NewClient
 	grpcClient, err := grpc.Dial(
 		conf.GRPCAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),

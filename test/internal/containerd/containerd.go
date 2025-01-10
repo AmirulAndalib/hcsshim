@@ -9,14 +9,14 @@ import (
 	"testing"
 
 	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/errdefs"
 	kubeutil "github.com/containerd/containerd/integration/remote/util"
 	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/remotes"
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/containerd/containerd/remotes/docker/config"
 	"github.com/containerd/containerd/snapshots"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/platforms"
 	"github.com/opencontainers/image-spec/identity"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -34,6 +34,9 @@ func createGRPCConn(ctx context.Context, address string) (*grpc.ClientConn, erro
 	if err != nil {
 		return nil, err
 	}
+
+	// TODO: use grpc.NewClient here instead
+	//nolint:staticcheck // SA1019: grpc.DialContext is deprecated
 	return grpc.DialContext(ctx, addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(dialer))

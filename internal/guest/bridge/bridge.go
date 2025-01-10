@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strconv"
 	"sync"
@@ -185,8 +186,8 @@ type Bridge struct {
 	hostState *hcsv2.Host
 
 	quitChan chan bool
-	// hasQuitPending when != 0 will cause no more requests to be Read.
-	hasQuitPending uint32
+	// hasQuitPending indicates the bridge is shutting down and cause no more requests to be Read.
+	hasQuitPending atomic.Bool
 
 	protVer prot.ProtocolVersion
 }
@@ -242,10 +243,10 @@ func (b *Bridge) ListenAndServe(bridgeIn io.ReadCloser, bridgeOut io.WriteCloser
 	go func() {
 		var recverr error
 		for {
-			if atomic.LoadUint32(&b.hasQuitPending) == 0 {
+			if !b.hasQuitPending.Load() {
 				header := &prot.MessageHeader{}
 				if err := binary.Read(bridgeIn, binary.LittleEndian, header); err != nil {
-					if err == io.ErrUnexpectedEOF || err == os.ErrClosed {
+					if err == io.ErrUnexpectedEOF || err == os.ErrClosed { //nolint:errorlint
 						break
 					}
 					recverr = errors.Wrap(err, "bridge: failed reading message header")
@@ -253,7 +254,7 @@ func (b *Bridge) ListenAndServe(bridgeIn io.ReadCloser, bridgeOut io.WriteCloser
 				}
 				message := make([]byte, header.Size-prot.MessageHeaderSize)
 				if _, err := io.ReadFull(bridgeIn, message); err != nil {
-					if err == io.ErrUnexpectedEOF || err == os.ErrClosed {
+					if err == io.ErrUnexpectedEOF || err == os.ErrClosed { //nolint:errorlint
 						break
 					}
 					recverr = errors.Wrap(err, "bridge: failed reading message payload")
@@ -309,17 +310,22 @@ func (b *Bridge) ListenAndServe(bridgeIn io.ReadCloser, bridgeOut io.WriteCloser
 					trace.StringAttribute("cid", base.ContainerID))
 
 				entry := log.G(ctx)
-				if entry.Logger.GetLevel() >= logrus.DebugLevel {
-					s := string(message)
+				if entry.Logger.GetLevel() > logrus.DebugLevel {
+					var err error
+					var msgBytes []byte
 					switch header.Type {
 					case prot.ComputeSystemCreateV1:
-						b, err := log.ScrubBridgeCreate(message)
-						s = string(b)
-						if err != nil {
-							entry.WithError(err).Warning("could not scrub bridge payload")
-						}
+						msgBytes, err = log.ScrubBridgeCreate(message)
+					case prot.ComputeSystemExecuteProcessV1:
+						msgBytes, err = log.ScrubBridgeExecProcess(message)
+					default:
+						msgBytes = message
 					}
-					entry.WithField("message", s).Debug("request read message")
+					s := string(msgBytes)
+					if err != nil {
+						entry.WithError(err).Warning("could not scrub bridge payload")
+					}
+					entry.WithField("message", s).Trace("request read message")
 				}
 				requestChan <- &Request{
 					Context:     ctx,
@@ -383,7 +389,8 @@ func (b *Bridge) ListenAndServe(bridgeIn io.ReadCloser, bridgeOut io.WriteCloser
 
 			s := trace.FromContext(resp.ctx)
 			if s != nil {
-				log.G(resp.ctx).WithField("message", string(responseBytes)).Debug("request write response")
+				log.G(resp.ctx).WithField("message", string(responseBytes)).Trace("request write response")
+				s.AddAttributes(trace.StringAttribute("response-message-type", resp.header.Type.String()))
 				s.End()
 			}
 		}
@@ -398,7 +405,7 @@ func (b *Bridge) ListenAndServe(bridgeIn io.ReadCloser, bridgeOut io.WriteCloser
 	case <-b.quitChan:
 		// The request loop needs to exit so that the teardown process begins.
 		// Set the request loop to stop processing new messages
-		atomic.StoreUint32(&b.hasQuitPending, 1)
+		b.hasQuitPending.Store(true)
 		// Wait for the request loop to process its last message. Its possible
 		// that if it lost the race with the hasQuitPending it could be stuck in
 		// a pending read from bridgeIn. Wait 2 seconds and kill the connection.
@@ -443,21 +450,23 @@ func setErrorForResponseBase(response *prot.MessageResponseBase, errForResponse 
 	errorMessage := errForResponse.Error()
 	stackString := ""
 	fileName := ""
-	lineNumber := -1
+	// We use -1 as a sentinel if no line number found (or it cannot be parsed),
+	// but that will ultimately end up as [math.MaxUint32], so set it to that explicitly.
+	// (Still keep using -1 for backwards compatibility ...)
+	lineNumber := uint32(math.MaxUint32)
 	functionName := ""
 	if stack := gcserr.BaseStackTrace(errForResponse); stack != nil {
 		bottomFrame := stack[0]
 		stackString = fmt.Sprintf("%+v", stack)
 		fileName = fmt.Sprintf("%s", bottomFrame)
 		lineNumberStr := fmt.Sprintf("%d", bottomFrame)
-		var err error
-		lineNumber, err = strconv.Atoi(lineNumberStr)
-		if err != nil {
+		if n, err := strconv.ParseUint(lineNumberStr, 10, 32); err == nil {
+			lineNumber = uint32(n)
+		} else {
 			logrus.WithFields(logrus.Fields{
 				"line-number":   lineNumberStr,
 				logrus.ErrorKey: err,
 			}).Error("opengcs::bridge::setErrorForResponseBase - failed to parse line number, using -1 instead")
-			lineNumber = -1
 		}
 		functionName = fmt.Sprintf("%n", bottomFrame)
 	}
@@ -474,7 +483,7 @@ func setErrorForResponseBase(response *prot.MessageResponseBase, errForResponse 
 		StackTrace:   stackString,
 		ModuleName:   "gcs",
 		FileName:     fileName,
-		Line:         uint32(lineNumber),
+		Line:         lineNumber,
 		FunctionName: functionName,
 	}
 	response.ErrorRecords = append(response.ErrorRecords, newRecord)

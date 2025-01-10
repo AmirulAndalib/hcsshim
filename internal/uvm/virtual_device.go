@@ -12,6 +12,7 @@ import (
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
 	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
+	"github.com/Microsoft/hcsshim/osversion"
 )
 
 const (
@@ -27,9 +28,16 @@ const (
 const vmbusChannelTypeGUIDFormatted = "{44c4f61d-4444-4400-9d52-802e27ede19f}"
 const assignedDeviceEnumerator = "VMBUS"
 
-type VPCIDeviceKey struct {
+type VPCIDeviceID struct {
 	deviceInstanceID     string
 	virtualFunctionIndex uint16
+}
+
+func NewVPCIDeviceID(deviceInstanceID string, virtualFunctionIndex uint16) VPCIDeviceID {
+	return VPCIDeviceID{
+		deviceInstanceID:     deviceInstanceID,
+		virtualFunctionIndex: virtualFunctionIndex,
+	}
 }
 
 // VPCIDevice represents a vpci device. Holds its guid and a handle to the uvm it
@@ -67,13 +75,19 @@ func (uvm *UtilityVM) GetAssignedDeviceVMBUSInstanceID(vmBusChannelGUID string) 
 // Release frees the resources of the corresponding vpci device
 func (vpci *VPCIDevice) Release(ctx context.Context) error {
 	if err := vpci.vm.RemoveDevice(ctx, vpci.deviceInstanceID, vpci.virtualFunctionIndex); err != nil {
-		return fmt.Errorf("failed to remove VPCI device: %s", err)
+		return fmt.Errorf("failed to remove VPCI device: %w", err)
 	}
 	return nil
 }
 
-// AssignDevice assigns a vpci device to the uvm
-// if the device already exists, the stored VPCIDevice's ref count is increased
+func IsValidDeviceType(deviceType string) bool {
+	return (deviceType == VPCIDeviceIDType) ||
+		(deviceType == VPCIDeviceIDTypeLegacy) ||
+		(deviceType == GPUDeviceIDType)
+}
+
+// AssignDevice assigns a vpci device to a uvm.
+// If the device already exists, the stored VPCIDevice's ref count is increased
 // and the VPCIDevice is returned.
 // Otherwise, a new request is made to assign the target device indicated by the deviceID
 // onto the UVM. A new VPCIDevice entry is made on the UVM and the VPCIDevice is returned
@@ -88,7 +102,7 @@ func (uvm *UtilityVM) AssignDevice(ctx context.Context, deviceID string, index u
 		vmBusGUID = guid.String()
 	}
 
-	key := VPCIDeviceKey{
+	key := VPCIDeviceID{
 		deviceInstanceID:     deviceID,
 		virtualFunctionIndex: index,
 	}
@@ -102,6 +116,12 @@ func (uvm *UtilityVM) AssignDevice(ctx context.Context, deviceID string, index u
 		return existingVPCIDevice, nil
 	}
 
+	var propagateAffinity *bool
+	T := true
+	if osversion.Get().Build >= osversion.V25H1Server {
+		propagateAffinity = &T
+	}
+
 	targetDevice := hcsschema.VirtualPciDevice{
 		Functions: []hcsschema.VirtualPciFunction{
 			{
@@ -109,6 +129,7 @@ func (uvm *UtilityVM) AssignDevice(ctx context.Context, deviceID string, index u
 				VirtualFunction:    index,
 			},
 		},
+		PropagateNumaAffinity: propagateAffinity,
 	}
 
 	request := &hcsschema.ModifySettingRequest{
@@ -135,22 +156,22 @@ func (uvm *UtilityVM) AssignDevice(ctx context.Context, deviceID string, index u
 	if err := uvm.modify(ctx, request); err != nil {
 		return nil, err
 	}
-	result := &VPCIDevice{
+	device := &VPCIDevice{
 		vm:                   uvm,
 		VMBusGUID:            vmBusGUID,
-		deviceInstanceID:     deviceID,
-		virtualFunctionIndex: index,
+		deviceInstanceID:     key.deviceInstanceID,
+		virtualFunctionIndex: key.virtualFunctionIndex,
 		refCount:             1,
 	}
-	uvm.vpciDevices[key] = result
-	return result, nil
+	uvm.vpciDevices[key] = device
+	return device, nil
 }
 
 // RemoveDevice removes a vpci device from a uvm when there are
 // no more references to a given VPCIDevice. Otherwise, decrements
 // the reference count of the stored VPCIDevice and returns nil.
 func (uvm *UtilityVM) RemoveDevice(ctx context.Context, deviceInstanceID string, index uint16) error {
-	key := VPCIDeviceKey{
+	key := VPCIDeviceID{
 		deviceInstanceID:     deviceInstanceID,
 		virtualFunctionIndex: index,
 	}

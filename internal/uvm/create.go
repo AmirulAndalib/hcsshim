@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 
+	"github.com/Microsoft/go-winio/pkg/guid"
 	"github.com/sirupsen/logrus"
 	"go.opencensus.io/trace"
 	"golang.org/x/sys/windows"
@@ -102,10 +103,29 @@ type Options struct {
 
 	// DumpDirectoryPath is the path of the directory inside which all debug dumps etc are stored.
 	DumpDirectoryPath string
+
+	// 	AdditionalHyperVConfig are extra Hyper-V socket configurations to provide.
+	AdditionalHyperVConfig map[string]hcsschema.HvSocketServiceConfig
+
+	// The following options are for implicit vNUMA topology settings.
+	// MaxSizePerNode is the maximum size of memory per vNUMA node.
+	MaxSizePerNode uint64
+	// MaxProcessorsPerNumaNode is the maximum number of processors per vNUMA node.
+	MaxProcessorsPerNumaNode uint32
+	// PhysicalNumaNodes are the preferred physical NUMA nodes to map to vNUMA nodes.
+	PreferredPhysicalNumaNodes []uint32
+
+	// The following options are for explicit vNUMA topology settings.
+	// NumaMappedPhysicalNodes are the physical NUMA nodes mapped to vNUMA nodes.
+	NumaMappedPhysicalNodes []uint32
+	// NumaProcessorCounts are the number of processors per vNUMA node.
+	NumaProcessorCounts []uint32
+	// NumaMemoryBlocksCounts are the number of memory blocks per vNUMA node.
+	NumaMemoryBlocksCounts []uint64
 }
 
 // Verifies that the final UVM options are correct and supported.
-func verifyOptions(ctx context.Context, options interface{}) error {
+func verifyOptions(_ context.Context, options interface{}) error {
 	switch opts := options.(type) {
 	case *OptionsLCOW:
 		if opts.EnableDeferredCommit && !opts.AllowOvercommit {
@@ -133,9 +153,6 @@ func verifyOptions(ctx context.Context, options interface{}) error {
 		if opts.EnableDeferredCommit && !opts.AllowOvercommit {
 			return errors.New("EnableDeferredCommit is not supported on physically backed VMs")
 		}
-		if len(opts.LayerFolders) < 2 {
-			return errors.New("at least 2 LayerFolders must be supplied")
-		}
 		if opts.SCSIControllerCount != 1 {
 			return errors.New("exactly 1 SCSI controller is required for WCOW")
 		}
@@ -150,15 +167,16 @@ func verifyOptions(ctx context.Context, options interface{}) error {
 // If `owner` is empty it will be set to the calling executables name.
 func newDefaultOptions(id, owner string) *Options {
 	opts := &Options{
-		ID:                    id,
-		Owner:                 owner,
-		MemorySizeInMB:        1024,
-		AllowOvercommit:       true,
-		EnableDeferredCommit:  false,
-		ProcessorCount:        defaultProcessorCount(),
-		FullyPhysicallyBacked: false,
-		NoWritableFileShares:  false,
-		SCSIControllerCount:   1,
+		ID:                     id,
+		Owner:                  owner,
+		MemorySizeInMB:         1024,
+		AllowOvercommit:        true,
+		EnableDeferredCommit:   false,
+		ProcessorCount:         defaultProcessorCount(),
+		FullyPhysicallyBacked:  false,
+		NoWritableFileShares:   false,
+		SCSIControllerCount:    1,
+		AdditionalHyperVConfig: make(map[string]hcsschema.HvSocketServiceConfig),
 	}
 
 	if opts.Owner == "" {
@@ -171,6 +189,13 @@ func newDefaultOptions(id, owner string) *Options {
 // ID returns the ID of the VM's compute system.
 func (uvm *UtilityVM) ID() string {
 	return uvm.hcsSystem.ID()
+}
+
+// RuntimeID returns Hyper-V VM GUID.
+//
+// Only valid after the utility VM has been created.
+func (uvm *UtilityVM) RuntimeID() guid.GUID {
+	return uvm.runtimeID
 }
 
 // OS returns the operating system of the utility VM.
@@ -274,7 +299,7 @@ func (uvm *UtilityVM) CreateContainer(ctx context.Context, id string, settings i
 	if uvm.gc != nil {
 		c, err := uvm.gc.CreateContainer(ctx, id, settings)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create container %s: %s", id, err)
+			return nil, fmt.Errorf("failed to create container %s: %w", id, err)
 		}
 		return c, nil
 	}
@@ -302,7 +327,7 @@ func (uvm *UtilityVM) CreateProcess(ctx context.Context, settings interface{}) (
 
 // IsOCI returns false, indicating the parameters to CreateProcess should not
 // include an OCI spec.
-func (uvm *UtilityVM) IsOCI() bool {
+func (*UtilityVM) IsOCI() bool {
 	return false
 }
 
@@ -342,9 +367,8 @@ func (uvm *UtilityVM) normalizeProcessorCount(ctx context.Context, requested int
 			"assigned":      hostCount,
 		}).Warn("Changing user requested CPUCount to current number of processors")
 		return hostCount
-	} else {
-		return requested
 	}
+	return requested
 }
 
 // ProcessorCount returns the number of processors actually assigned to the UVM.
@@ -353,7 +377,7 @@ func (uvm *UtilityVM) ProcessorCount() int32 {
 }
 
 // PhysicallyBacked returns if the UVM is backed by physical memory
-// (Over commit and deferred commit both false)
+// (Over commit and deferred commit both false).
 func (uvm *UtilityVM) PhysicallyBacked() bool {
 	return uvm.physicallyBacked
 }
@@ -377,12 +401,12 @@ func (uvm *UtilityVM) normalizeMemorySize(ctx context.Context, requested uint64)
 }
 
 // DevicesPhysicallyBacked describes if additional devices added to the UVM
-// should be physically backed
+// should be physically backed.
 func (uvm *UtilityVM) DevicesPhysicallyBacked() bool {
 	return uvm.devicesPhysicallyBacked
 }
 
-// VSMBNoDirectMap returns if VSMB devices should be mounted with `NoDirectMap` set to true
+// VSMBNoDirectMap returns if VSMB devices should be mounted with `NoDirectMap` set to true.
 func (uvm *UtilityVM) VSMBNoDirectMap() bool {
 	return uvm.vsmbNoDirectMap
 }
@@ -394,11 +418,12 @@ func (uvm *UtilityVM) NoWritableFileShares() bool {
 // Closes the external GCS connection if it is being used and also closes the
 // listener for GCS connection.
 func (uvm *UtilityVM) CloseGCSConnection() (err error) {
+	// TODO: errors.Join to avoid ignoring an error
 	if uvm.gc != nil {
 		err = uvm.gc.Close()
 	}
 	if uvm.gcListener != nil {
 		err = uvm.gcListener.Close()
 	}
-	return
+	return err
 }

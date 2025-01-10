@@ -1,6 +1,5 @@
-//go:build windows && (functional || uvmscsi)
-// +build windows
-// +build functional uvmscsi
+//go:build windows && functional
+// +build windows,functional
 
 package functional
 
@@ -14,27 +13,30 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Microsoft/hcsshim/internal/wclayer"
+	"github.com/sirupsen/logrus"
 
 	"github.com/Microsoft/hcsshim/internal/lcow"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 	"github.com/Microsoft/hcsshim/internal/uvm/scsi"
+	"github.com/Microsoft/hcsshim/internal/wclayer"
 	"github.com/Microsoft/hcsshim/osversion"
+
 	testutilities "github.com/Microsoft/hcsshim/test/internal"
+	"github.com/Microsoft/hcsshim/test/internal/util"
 	"github.com/Microsoft/hcsshim/test/pkg/require"
-	tuvm "github.com/Microsoft/hcsshim/test/pkg/uvm"
-	"github.com/sirupsen/logrus"
+	testuvm "github.com/Microsoft/hcsshim/test/pkg/uvm"
 )
 
-// TestSCSIAddRemovev2LCOW validates adding and removing SCSI disks
+// TestSCSIAddRemove2LCOW validates adding and removing SCSI disks
 // from a utility VM in both attach-only and with a container path.
 func TestSCSIAddRemoveLCOW(t *testing.T) {
 	t.Skip("not yet updated")
 
 	require.Build(t, osversion.RS5)
-	requireFeatures(t, featureLCOW, featureSCSI)
+	requireFeatures(t, featureLCOW, featureUVM, featureSCSI)
 
-	u := tuvm.CreateAndStartLCOWFromOpts(context.Background(), t, defaultLCOWOptions(t))
+	ctx := util.Context(context.Background(), t)
+	u := testuvm.CreateAndStartLCOWFromOpts(ctx, t, defaultLCOWOptions(ctx, t))
 	defer u.Close()
 
 	testSCSIAddRemoveMultiple(t, u, `/run/gcs/c/0/scsi`, "linux", []string{})
@@ -46,10 +48,12 @@ func TestSCSIAddRemoveWCOW(t *testing.T) {
 	t.Skip("not yet updated")
 
 	require.Build(t, osversion.RS5)
-	requireFeatures(t, featureWCOW, featureSCSI)
+	requireFeatures(t, featureWCOW, featureUVM, featureSCSI)
 
+	ctx := util.Context(context.Background(), t)
 	// TODO make the image configurable to the build we're testing on
-	u, layers, _ := tuvm.CreateWCOWUVM(context.Background(), t, t.Name(), "mcr.microsoft.com/windows/nanoserver:1903")
+	//nolint:staticcheck // SA1019: deprecated; will be replaced when test is updated
+	u, layers, _ := testuvm.CreateWCOWUVM(ctx, t, t.Name(), "mcr.microsoft.com/windows/nanoserver:1903")
 	defer u.Close()
 
 	testSCSIAddRemoveSingle(t, u, `c:\`, "windows", layers)
@@ -62,7 +66,7 @@ func testAddSCSI(u *uvm.UtilityVM, disks []string, attachOnly bool) ([]*scsi.Mou
 		if !attachOnly {
 			mc = &scsi.MountConfig{}
 		}
-		scsiMount, err := u.SCSIManager.AddVirtualDisk(context.Background(), disks[i], false, u.ID(), mc)
+		scsiMount, err := u.SCSIManager.AddVirtualDisk(context.Background(), disks[i], false, u.ID(), "", mc)
 		if err != nil {
 			return nil, err
 		}
@@ -80,8 +84,7 @@ func testRemoveAllSCSI(mounts []*scsi.Mount) error {
 	return nil
 }
 
-// TODO this test is only needed until WCOW supports adding the same scsi device to
-// multiple containers
+// TODO this test is only needed until WCOW supports adding the same scsi device to multiple containers.
 func testSCSIAddRemoveSingle(t *testing.T, u *uvm.UtilityVM, pathPrefix string, operatingSystem string, wcowImageLayerFolders []string) {
 	t.Helper()
 	numDisks := 63 // Windows: 63 as the UVM scratch is at 0:0
@@ -221,14 +224,15 @@ func TestParallelScsiOps(t *testing.T) {
 	t.Skip("not yet updated")
 
 	require.Build(t, osversion.RS5)
-	requireFeatures(t, featureLCOW, featureSCSI)
+	requireFeatures(t, featureLCOW, featureUVM, featureSCSI)
 
-	u := tuvm.CreateAndStartLCOWFromOpts(context.Background(), t, defaultLCOWOptions(t))
+	ctx := util.Context(context.Background(), t)
+	u := testuvm.CreateAndStartLCOWFromOpts(ctx, t, defaultLCOWOptions(ctx, t))
 	defer u.Close()
 
 	// Create a sandbox to use
 	tempDir := t.TempDir()
-	if err := lcow.CreateScratch(context.Background(), u, filepath.Join(tempDir, "sandbox.vhdx"), lcow.DefaultScratchSizeGB, ""); err != nil {
+	if err := lcow.CreateScratch(ctx, u, filepath.Join(tempDir, "sandbox.vhdx"), lcow.DefaultScratchSizeGB, ""); err != nil {
 		t.Fatalf("failed to create EXT4 scratch for LCOW test cases: %s", err)
 	}
 	copySandbox := func(dir string, workerId, iteration int) (string, error) {
@@ -276,7 +280,7 @@ func TestParallelScsiOps(t *testing.T) {
 					continue
 				}
 
-				mount, err := u.SCSIManager.AddVirtualDisk(context.Background(), path, false, u.ID(), nil)
+				mount, err := u.SCSIManager.AddVirtualDisk(context.Background(), path, false, u.ID(), "", nil)
 				if err != nil {
 					os.Remove(path)
 					t.Errorf("failed to add SCSI disk for worker: %d, iteration: %d with err: %v", scsiIndex, iteration, err)
@@ -289,7 +293,7 @@ func TestParallelScsiOps(t *testing.T) {
 					break
 				}
 
-				mount, err = u.SCSIManager.AddVirtualDisk(context.Background(), path, false, u.ID(), &scsi.MountConfig{})
+				mount, err = u.SCSIManager.AddVirtualDisk(context.Background(), path, false, u.ID(), "", &scsi.MountConfig{})
 				if err != nil {
 					os.Remove(path)
 					t.Errorf("failed to add SCSI disk for worker: %d, iteration: %d with err: %v", scsiIndex, iteration, err)
