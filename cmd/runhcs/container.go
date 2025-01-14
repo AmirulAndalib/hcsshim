@@ -18,6 +18,7 @@ import (
 	"github.com/Microsoft/hcsshim/internal/cni"
 	"github.com/Microsoft/hcsshim/internal/hcs"
 	"github.com/Microsoft/hcsshim/internal/hcsoci"
+	"github.com/Microsoft/hcsshim/internal/layers"
 	"github.com/Microsoft/hcsshim/internal/logfields"
 	"github.com/Microsoft/hcsshim/internal/oci"
 	"github.com/Microsoft/hcsshim/internal/regstate"
@@ -341,7 +342,7 @@ func createContainer(cfg *containerConfig) (_ *container, err error) {
 				// RS4 case
 				err = stateKey.Get(cfg.Spec.Windows.Network.NetworkSharedContainerName, keyNetNS, &netNS)
 				if err != nil {
-					if _, ok := err.(*regstate.NoStateError); !ok {
+					if _, ok := err.(*regstate.NoStateError); !ok { //nolint:errorlint // legacy code
 						return nil, err
 					}
 				}
@@ -402,21 +403,10 @@ func createContainer(cfg *containerConfig) (_ *container, err error) {
 		case *uvm.OptionsLCOW:
 			opts.ConsolePipe = cfg.VMConsolePipe
 		case *uvm.OptionsWCOW:
-			// In order for the UVM sandbox.vhdx not to collide with the actual
-			// nested Argon sandbox.vhdx we append the \vm folder to the last entry
-			// in the list.
-			layersLen := len(cfg.Spec.Windows.LayerFolders)
-			layers := make([]string, layersLen)
-			copy(layers, cfg.Spec.Windows.LayerFolders)
-
-			vmPath := filepath.Join(layers[layersLen-1], "vm")
-			err := os.MkdirAll(vmPath, 0)
+			opts.BootFiles, err = layers.GetWCOWUVMBootFilesFromLayers(context.Background(), nil, cfg.Spec.Windows.LayerFolders)
 			if err != nil {
 				return nil, err
 			}
-			layers[layersLen-1] = vmPath
-
-			opts.LayerFolders = layers
 		}
 
 		shim, err := c.startVMShim(cfg.VMLogFile, opts)
@@ -473,7 +463,7 @@ func (c *container) VMIsolated() bool {
 func (c *container) unmountInHost(vm *uvm.UtilityVM, all bool) error {
 	r := &resources.Resources{}
 	err := stateKey.Get(c.ID, keyResources, r)
-	if _, ok := err.(*regstate.NoStateError); ok {
+	if _, ok := err.(*regstate.NoStateError); ok { //nolint:errorlint // legacy code
 		return nil
 	}
 	if err != nil {
@@ -499,7 +489,7 @@ func (c *container) Unmount(all bool) error {
 			op = runhcs.OpUnmountContainer
 		}
 		err := c.issueVMRequest(op)
-		if _, ok := err.(*noVMError); ok {
+		if _, ok := err.(*noVMError); ok { //nolint:errorlint // legacy code
 			logrus.WithFields(logrus.Fields{
 				logfields.ContainerID: c.ID,
 				logfields.UVMID:       c.HostID,
@@ -641,7 +631,7 @@ func getContainer(id string, notStopped bool) (*container, error) {
 	}
 	err = stateKey.Get(id, keyShimPid, &c.ShimPid)
 	if err != nil {
-		if _, ok := err.(*regstate.NoStateError); !ok {
+		if _, ok := err.(*regstate.NoStateError); !ok { //nolint:errorlint // legacy code
 			return nil, err
 		}
 		c.ShimPid = -1

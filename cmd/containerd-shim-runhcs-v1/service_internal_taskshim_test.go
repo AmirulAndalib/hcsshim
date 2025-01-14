@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -17,8 +18,8 @@ import (
 	"github.com/Microsoft/hcsshim/internal/hcsoci"
 	"github.com/Microsoft/hcsshim/pkg/ctrdtaskapi"
 	task "github.com/containerd/containerd/api/runtime/task/v2"
-	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/protobuf"
+	"github.com/containerd/errdefs"
 	typeurl "github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -615,7 +616,7 @@ func Test_TaskShim_updateInternal_Error(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected to get an error for incorrect resource's type")
 	}
-	if err != errNotSupportedResourcesRequest {
+	if !errors.Is(err, errNotSupportedResourcesRequest) {
 		t.Fatalf("expected to get errNotSupportedResourcesRequest, instead got %v", err)
 	}
 }

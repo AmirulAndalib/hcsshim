@@ -16,9 +16,11 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"go.opencensus.io/trace"
 	"golang.org/x/sys/windows"
 
 	"github.com/Microsoft/hcsshim/internal/log"
+	"github.com/Microsoft/hcsshim/internal/oc"
 )
 
 const (
@@ -258,6 +260,9 @@ func (brdg *bridge) recvLoopRoutine() {
 }
 
 func readMessage(r io.Reader) (int64, msgType, []byte, error) {
+	_, span := oc.StartSpan(context.Background(), "bridge receive read message", oc.WithClientSpanKind)
+	defer span.End()
+
 	var h [hdrSize]byte
 	_, err := io.ReadFull(r, h[:])
 	if err != nil {
@@ -266,6 +271,10 @@ func readMessage(r io.Reader) (int64, msgType, []byte, error) {
 	typ := msgType(binary.LittleEndian.Uint32(h[hdrOffType:]))
 	n := binary.LittleEndian.Uint32(h[hdrOffSize:])
 	id := int64(binary.LittleEndian.Uint64(h[hdrOffID:]))
+	span.AddAttributes(
+		trace.StringAttribute("type", typ.String()),
+		trace.Int64Attribute("message-id", id))
+
 	if n < hdrSize || n > maxMsgSize {
 		return 0, 0, nil, fmt.Errorf("invalid message size %d", n)
 	}
@@ -290,15 +299,16 @@ func (brdg *bridge) recvLoop() error {
 	for {
 		id, typ, b, err := readMessage(br)
 		if err != nil {
-			if err == io.EOF || isLocalDisconnectError(err) {
+			if err == io.EOF || isLocalDisconnectError(err) { //nolint:errorlint
 				return nil
 			}
-			return fmt.Errorf("bridge read failed: %s", err)
+			return fmt.Errorf("bridge read failed: %w", err)
 		}
 		brdg.log.WithFields(logrus.Fields{
 			"payload":    string(b),
 			"type":       typ.String(),
-			"message-id": id}).Debug("bridge receive")
+			"message-id": id}).Trace("bridge receive")
+
 		switch typ & msgTypeMask {
 		case msgTypeResponse:
 			// Find the request associated with this response.
@@ -311,7 +321,7 @@ func (brdg *bridge) recvLoop() error {
 			}
 			err := json.Unmarshal(b, call.resp)
 			if err != nil {
-				err = fmt.Errorf("bridge response unmarshal failed: %s", err)
+				err = fmt.Errorf("bridge response unmarshal failed: %w", err)
 			} else if resp := call.resp.Base(); resp.Result != 0 {
 				for _, rec := range resp.ErrorRecords {
 					brdg.log.WithFields(logrus.Fields{
@@ -340,11 +350,11 @@ func (brdg *bridge) recvLoop() error {
 			ntf.ResultInfo.Value = &json.RawMessage{}
 			err := json.Unmarshal(b, &ntf)
 			if err != nil {
-				return fmt.Errorf("bridge response unmarshal failed: %s", err)
+				return fmt.Errorf("bridge response unmarshal failed: %w", err)
 			}
 			err = brdg.notify(&ntf)
 			if err != nil {
-				return fmt.Errorf("bridge notification failed: %s", err)
+				return fmt.Errorf("bridge notification failed: %w", err)
 			}
 		default:
 			return fmt.Errorf("bridge received unknown unknown message type %s", typ)
@@ -372,19 +382,27 @@ func (brdg *bridge) sendLoop() {
 }
 
 func (brdg *bridge) writeMessage(buf *bytes.Buffer, enc *json.Encoder, typ msgType, id int64, req interface{}) error {
+	var err error
+	_, span := oc.StartSpan(context.Background(), "bridge send", oc.WithClientSpanKind)
+	defer span.End()
+	defer func() { oc.SetSpanStatus(span, err) }()
+	span.AddAttributes(
+		trace.StringAttribute("type", typ.String()),
+		trace.Int64Attribute("message-id", id))
+
 	// Prepare the buffer with the message.
 	var h [hdrSize]byte
 	binary.LittleEndian.PutUint32(h[hdrOffType:], uint32(typ))
 	binary.LittleEndian.PutUint64(h[hdrOffID:], uint64(id))
 	buf.Write(h[:])
-	err := enc.Encode(req)
+	err = enc.Encode(req)
 	if err != nil {
-		return fmt.Errorf("bridge encode: %s", err)
+		return fmt.Errorf("bridge encode: %w", err)
 	}
 	// Update the message header with the size.
 	binary.LittleEndian.PutUint32(buf.Bytes()[hdrOffSize:], uint32(buf.Len()))
 
-	if brdg.log.Logger.GetLevel() >= logrus.DebugLevel {
+	if brdg.log.Logger.GetLevel() > logrus.DebugLevel {
 		b := buf.Bytes()[hdrSize:]
 		switch typ {
 		// container environment vars are in rpCreate for linux; rpcExecuteProcess for windows
@@ -399,13 +417,13 @@ func (brdg *bridge) writeMessage(buf *bytes.Buffer, enc *json.Encoder, typ msgTy
 		brdg.log.WithFields(logrus.Fields{
 			"payload":    string(b),
 			"type":       typ.String(),
-			"message-id": id}).Debug("bridge send")
+			"message-id": id}).Trace("bridge send")
 	}
 
 	// Write the message.
 	_, err = buf.WriteTo(brdg.conn)
 	if err != nil {
-		return fmt.Errorf("bridge write: %s", err)
+		return fmt.Errorf("bridge write: %w", err)
 	}
 	return nil
 }

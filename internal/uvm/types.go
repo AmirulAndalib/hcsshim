@@ -6,13 +6,13 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Microsoft/go-winio/pkg/guid"
 	"golang.org/x/sys/windows"
 
 	"github.com/Microsoft/hcsshim/internal/gcs"
 	"github.com/Microsoft/hcsshim/internal/hcs"
-	"github.com/Microsoft/hcsshim/internal/hcs/schema1"
 	"github.com/Microsoft/hcsshim/internal/hns"
 	"github.com/Microsoft/hcsshim/internal/uvm/scsi"
 )
@@ -54,13 +54,11 @@ type UtilityVM struct {
 
 	// GCS bridge protocol and capabilities
 	protocol  uint32
-	guestCaps schema1.GuestDefinedCapabilities
+	guestCaps gcs.GuestDefinedCapabilities
 
-	// containerCounter is the current number of containers that have been
-	// created. This is never decremented in the life of the UVM.
-	//
-	// NOTE: All accesses to this MUST be done atomically.
-	containerCounter uint64
+	// containerCounter is the current number of containers that have been created.
+	// This is never decremented in the life of the UVM.
+	containerCounter atomic.Uint64
 
 	// noWritableFileShares disables mounting any writable vSMB or Plan9 shares
 	// on the uVM. This prevents containers in the uVM modifying files and directories
@@ -93,8 +91,8 @@ type UtilityVM struct {
 	scsiControllerCount uint32 // Number of SCSI controllers in the utility VM
 	reservedSCSISlots   []scsi.Slot
 
-	encryptScratch bool                          // Enable scratch encryption
-	vpciDevices    map[VPCIDeviceKey]*VPCIDevice // map of device instance id to vpci device
+	encryptScratch bool                         // Enable scratch encryption
+	vpciDevices    map[VPCIDeviceID]*VPCIDevice // map of device instance id to vpci device
 
 	// Plan9 are directories mapped into a Linux utility VM
 	plan9Counter uint64 // Each newly-added plan9 share has a counter used as its ID in the ResourceURI and for the name
@@ -118,8 +116,7 @@ type UtilityVM struct {
 
 	// mountCounter is the number of mounts that have been added to the UVM
 	// This is used in generating a unique mount path inside the UVM for every mount.
-	// Access to this variable should be done atomically.
-	mountCounter uint64
+	mountCounter atomic.Uint64
 
 	// Location that container process dumps will get written too.
 	processDumpLocation string
@@ -152,3 +149,13 @@ func (uvm *UtilityVM) ScratchEncryptionEnabled() bool {
 type OutputHandler func(io.Reader)
 
 type OutputHandlerCreator func(*Options) OutputHandler
+
+type WCOWBootFiles struct {
+	// Path to the directory that contains the OS files.
+	OSFilesPath string
+	// Path of the boot directory relative to the `OSFilesPath`. This boot directory MUST
+	// contain the BCD & bootmgfw.efi files.
+	OSRelativeBootDirPath string
+	// Path for the scratch VHD of thef UVM
+	ScratchVHDPath string
+}

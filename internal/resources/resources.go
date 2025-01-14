@@ -97,6 +97,12 @@ type ResourceCloser interface {
 	Release(context.Context) error
 }
 
+type ResourceCloserFunc func(context.Context) error
+
+func (f ResourceCloserFunc) Release(ctx context.Context) error {
+	return f(ctx)
+}
+
 // NewContainerResources returns a new empty container Resources struct with the
 // given container id
 func NewContainerResources(id string) *Resources {
@@ -158,6 +164,30 @@ func ReleaseResources(ctx context.Context, r *Resources, vm *uvm.UtilityVM, all 
 	if r.layers != nil {
 		if err := r.layers.Release(ctx); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+type ResourceCloserList struct {
+	closers []ResourceCloser
+}
+
+func (l *ResourceCloserList) Add(rOp ResourceCloser) *ResourceCloserList {
+	l.closers = append(l.closers, rOp)
+	return l
+}
+
+func (l *ResourceCloserList) AddFunc(rOp ResourceCloserFunc) *ResourceCloserList {
+	l.closers = append(l.closers, rOp)
+	return l
+}
+
+func (l *ResourceCloserList) Release(ctx context.Context) error {
+	// MUST release in the reverse order
+	for i := len(l.closers) - 1; i >= 0; i-- {
+		if oErr := l.closers[i].Release(ctx); oErr != nil {
+			return oErr
 		}
 	}
 	return nil

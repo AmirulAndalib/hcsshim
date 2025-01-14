@@ -5,6 +5,7 @@ package uvm
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 
@@ -23,9 +24,7 @@ import (
 	"github.com/Microsoft/hcsshim/internal/schemaversion"
 	"github.com/Microsoft/hcsshim/internal/security"
 	"github.com/Microsoft/hcsshim/internal/uvm/scsi"
-	"github.com/Microsoft/hcsshim/internal/uvmfolder"
 	"github.com/Microsoft/hcsshim/internal/wclayer"
-	"github.com/Microsoft/hcsshim/internal/wcow"
 	"github.com/Microsoft/hcsshim/osversion"
 )
 
@@ -33,17 +32,20 @@ import (
 type OptionsWCOW struct {
 	*Options
 
-	LayerFolders []string // Set of folders for base layers and scratch. Ordered from top most read-only through base read-only layer, followed by scratch
+	BootFiles *WCOWBootFiles
 
 	// NoDirectMap specifies that no direct mapping should be used for any VSMBs added to the UVM
 	NoDirectMap bool
 
 	// NoInheritHostTimezone specifies whether to not inherit the hosts timezone for the UVM. UTC will be set as the default for the VM instead.
 	NoInheritHostTimezone bool
+
+	// AdditionalRegistryKeys are Registry keys and their values to additionally add to the uVM.
+	AdditionalRegistryKeys []hcsschema.RegistryValue
 }
 
 // NewDefaultOptionsWCOW creates the default options for a bootable version of
-// WCOW. The caller `MUST` set the `LayerFolders` path on the returned value.
+// WCOW. The caller `MUST` set the `BootFiles` on the returned value.
 //
 // `id` the ID of the compute system. If not passed will generate a new GUID.
 //
@@ -51,7 +53,8 @@ type OptionsWCOW struct {
 // executable files name.
 func NewDefaultOptionsWCOW(id, owner string) *OptionsWCOW {
 	return &OptionsWCOW{
-		Options: newDefaultOptions(id, owner),
+		Options:                newDefaultOptions(id, owner),
+		AdditionalRegistryKeys: []hcsschema.RegistryValue{},
 	}
 }
 
@@ -69,10 +72,10 @@ func (uvm *UtilityVM) startExternalGcsListener(ctx context.Context) error {
 	return nil
 }
 
-func prepareConfigDoc(ctx context.Context, uvm *UtilityVM, opts *OptionsWCOW, uvmFolder string) (*hcsschema.ComputeSystem, error) {
+func prepareConfigDoc(ctx context.Context, uvm *UtilityVM, opts *OptionsWCOW) (*hcsschema.ComputeSystem, error) {
 	processorTopology, err := processorinfo.HostProcessorInfo(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get host processor information: %s", err)
+		return nil, fmt.Errorf("failed to get host processor information: %w", err)
 	}
 
 	// To maintain compatibility with Docker we need to automatically downgrade
@@ -90,7 +93,7 @@ func prepareConfigDoc(ctx context.Context, uvm *UtilityVM, opts *OptionsWCOW, uv
 		Shares: []hcsschema.VirtualSmbShare{
 			{
 				Name:    "os",
-				Path:    filepath.Join(uvmFolder, `UtilityVM\Files`),
+				Path:    opts.BootFiles.OSFilesPath,
 				Options: vsmbOpts,
 			},
 		},
@@ -109,21 +112,21 @@ func prepareConfigDoc(ctx context.Context, uvm *UtilityVM, opts *OptionsWCOW, uv
 		registryChanges.AddValues = append(registryChanges.AddValues,
 			hcsschema.RegistryValue{
 				Key: &hcsschema.RegistryKey{
-					Hive: "System",
+					Hive: hcsschema.RegistryHive_SYSTEM,
 					Name: "ControlSet001\\Services\\WerSvc",
 				},
 				Name:       "Start",
 				DWordValue: 2,
-				Type_:      "DWord",
+				Type_:      hcsschema.RegistryValueType_D_WORD,
 			},
 			hcsschema.RegistryValue{
 				Key: &hcsschema.RegistryKey{
-					Hive: "Software",
+					Hive: hcsschema.RegistryHive_SOFTWARE,
 					Name: "Microsoft\\Windows\\Windows Error Reporting",
 				},
 				Name:       "Disabled",
 				DWordValue: 1,
-				Type_:      "DWord",
+				Type_:      hcsschema.RegistryValueType_D_WORD,
 			},
 		)
 	}
@@ -136,21 +139,42 @@ func prepareConfigDoc(ctx context.Context, uvm *UtilityVM, opts *OptionsWCOW, uv
 		registryChanges.AddValues = append(registryChanges.AddValues,
 			hcsschema.RegistryValue{
 				Key: &hcsschema.RegistryKey{
-					Hive: "System",
+					Hive: hcsschema.RegistryHive_SYSTEM,
 					Name: "CurrentControlSet\\Services\\gns",
 				},
 				Name:       "EnableCompartmentNamespace",
 				DWordValue: 1,
-				Type_:      "DWord",
+				Type_:      hcsschema.RegistryValueType_D_WORD,
 			},
 		)
 	}
 
-	processor := &hcsschema.Processor2{
-		Count:  uvm.processorCount,
-		Limit:  opts.ProcessorLimit,
-		Weight: opts.ProcessorWeight,
+	registryChanges.AddValues = append(registryChanges.AddValues, opts.AdditionalRegistryKeys...)
+
+	processor := &hcsschema.VirtualMachineProcessor{
+		Count:  uint32(uvm.processorCount),
+		Limit:  uint64(opts.ProcessorLimit),
+		Weight: uint64(opts.ProcessorWeight),
 	}
+
+	numa, numaProcessors, err := prepareVNumaTopology(opts.Options)
+	if err != nil {
+		return nil, err
+	}
+
+	if numa != nil {
+		if opts.AllowOvercommit {
+			return nil, fmt.Errorf("vNUMA supports only Physical memory backing type")
+		}
+		if err := validateNumaForVM(numa, processor.Count, memorySizeInMB); err != nil {
+			return nil, fmt.Errorf("failed to validate vNUMA settings: %w", err)
+		}
+	}
+
+	if numaProcessors != nil {
+		processor.NumaProcessorsSettings = numaProcessors
+	}
+
 	// We can set a cpu group for the VM at creation time in recent builds.
 	if opts.CPUGroupID != "" {
 		if osversion.Build() < osversion.V21H1 {
@@ -168,14 +192,14 @@ func prepareConfigDoc(ctx context.Context, uvm *UtilityVM, opts *OptionsWCOW, uv
 			Chipset: &hcsschema.Chipset{
 				Uefi: &hcsschema.Uefi{
 					BootThis: &hcsschema.UefiBootEntry{
-						DevicePath: `\EFI\Microsoft\Boot\bootmgfw.efi`,
+						DevicePath: filepath.Join(opts.BootFiles.OSRelativeBootDirPath, "bootmgfw.efi"),
 						DeviceType: "VmbFs",
 					},
 				},
 			},
 			RegistryChanges: &registryChanges,
 			ComputeTopology: &hcsschema.Topology{
-				Memory: &hcsschema.Memory2{
+				Memory: &hcsschema.VirtualMachineMemory{
 					SizeInMB:        memorySizeInMB,
 					AllowOvercommit: opts.AllowOvercommit,
 					// EnableHotHint is not compatible with physical.
@@ -186,19 +210,29 @@ func prepareConfigDoc(ctx context.Context, uvm *UtilityVM, opts *OptionsWCOW, uv
 					HighMMIOGapInMB:      opts.HighMMIOGapInMB,
 				},
 				Processor: processor,
+				Numa:      numa,
 			},
 			Devices: &hcsschema.Devices{
 				HvSocket: &hcsschema.HvSocket2{
 					HvSocketConfig: &hcsschema.HvSocketSystemConfig{
-						// Allow administrators and SYSTEM to bind to vsock sockets
-						// so that we can create a GCS log socket.
+						// Allow administrators and SYSTEM to bind to hyper-v sockets
+						// so that we can communicate to the GCS.
 						DefaultBindSecurityDescriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)",
+						ServiceTable:                  make(map[string]hcsschema.HvSocketServiceConfig),
 					},
 				},
 				VirtualSmb: virtualSMB,
 			},
 		},
 	}
+
+	// Expose ACPI information into UVM
+	if numa != nil || numaProcessors != nil {
+		firmwareFallbackMeasured := hcsschema.VirtualSlitType_FIRMWARE_FALLBACK_MEASURED
+		doc.VirtualMachine.ComputeTopology.Memory.SlitType = &firmwareFallbackMeasured
+	}
+
+	maps.Copy(doc.VirtualMachine.Devices.HvSocket.HvSocketConfig.ServiceTable, opts.AdditionalHyperVConfig)
 
 	// Handle StorageQoS if set
 	if opts.StorageQoSBandwidthMaximum > 0 || opts.StorageQoSIopsMaximum > 0 {
@@ -246,7 +280,7 @@ func CreateWCOW(ctx context.Context, opts *OptionsWCOW) (_ *UtilityVM, err error
 	}
 
 	span.AddAttributes(trace.StringAttribute(logfields.UVMID, opts.ID))
-	log.G(ctx).WithField("options", fmt.Sprintf("%+v", opts)).Debug("uvm::CreateWCOW options")
+	log.G(ctx).WithField("options", log.Format(ctx, opts)).Debug("uvm::CreateWCOW options")
 
 	uvm := &UtilityVM{
 		id:                      opts.ID,
@@ -255,7 +289,7 @@ func CreateWCOW(ctx context.Context, opts *OptionsWCOW) (_ *UtilityVM, err error
 		scsiControllerCount:     opts.SCSIControllerCount,
 		vsmbDirShares:           make(map[string]*VSMBShare),
 		vsmbFileShares:          make(map[string]*VSMBShare),
-		vpciDevices:             make(map[VPCIDeviceKey]*VPCIDevice),
+		vpciDevices:             make(map[VPCIDeviceID]*VPCIDevice),
 		noInheritHostTimezone:   opts.NoInheritHostTimezone,
 		physicallyBacked:        !opts.AllowOvercommit,
 		devicesPhysicallyBacked: opts.FullyPhysicallyBacked,
@@ -274,42 +308,13 @@ func CreateWCOW(ctx context.Context, opts *OptionsWCOW) (_ *UtilityVM, err error
 		return nil, errors.Wrap(err, errBadUVMOpts.Error())
 	}
 
-	uvmFolder, err := uvmfolder.LocateUVMFolder(ctx, opts.LayerFolders)
+	doc, err := prepareConfigDoc(ctx, uvm, opts)
 	if err != nil {
-		return nil, fmt.Errorf("failed to locate utility VM folder from layer folders: %s", err)
+		return nil, fmt.Errorf("error in preparing config doc: %w", err)
 	}
 
-	// TODO: BUGBUG Remove this. @jhowardmsft
-	//       It should be the responsibility of the caller to do the creation and population.
-	//       - Update runhcs too (vm.go).
-	//       - Remove comment in function header
-	//       - Update tests that rely on this current behavior.
-	// Create the RW scratch in the top-most layer folder, creating the folder if it doesn't already exist.
-	scratchFolder := opts.LayerFolders[len(opts.LayerFolders)-1]
-
-	// Create the directory if it doesn't exist
-	if _, err := os.Stat(scratchFolder); os.IsNotExist(err) {
-		if err := os.MkdirAll(scratchFolder, 0777); err != nil {
-			return nil, fmt.Errorf("failed to create utility VM scratch folder: %s", err)
-		}
-	}
-
-	doc, err := prepareConfigDoc(ctx, uvm, opts, uvmFolder)
-	if err != nil {
-		return nil, fmt.Errorf("error in preparing config doc: %s", err)
-	}
-
-	// Create sandbox.vhdx in the scratch folder based on the template, granting the correct permissions to it
-	scratchPath := filepath.Join(scratchFolder, "sandbox.vhdx")
-	if _, err := os.Stat(scratchPath); os.IsNotExist(err) {
-		if err := wcow.CreateUVMScratch(ctx, uvmFolder, scratchFolder, uvm.id); err != nil {
-			return nil, fmt.Errorf("failed to create scratch: %s", err)
-		}
-	} else {
-		// Sandbox.vhdx exists, just need to grant vm access to it.
-		if err := wclayer.GrantVmAccess(ctx, uvm.id, scratchPath); err != nil {
-			return nil, errors.Wrap(err, "failed to grant vm access to scratch")
-		}
+	if err := wclayer.GrantVmAccess(ctx, uvm.id, opts.BootFiles.ScratchVHDPath); err != nil {
+		return nil, errors.Wrap(err, "failed to grant vm access to scratch")
 	}
 
 	doc.VirtualMachine.Devices.Scsi = map[string]hcsschema.Scsi{}
@@ -321,7 +326,7 @@ func CreateWCOW(ctx context.Context, opts *OptionsWCOW) (_ *UtilityVM, err error
 
 	doc.VirtualMachine.Devices.Scsi[guestrequest.ScsiControllerGuids[0]].Attachments["0"] = hcsschema.Attachment{
 
-		Path:  scratchPath,
+		Path:  opts.BootFiles.ScratchVHDPath,
 		Type_: "VirtualDisk",
 	}
 
@@ -329,7 +334,7 @@ func CreateWCOW(ctx context.Context, opts *OptionsWCOW) (_ *UtilityVM, err error
 
 	err = uvm.create(ctx, doc)
 	if err != nil {
-		return nil, fmt.Errorf("error while creating the compute system: %s", err)
+		return nil, fmt.Errorf("error while creating the compute system: %w", err)
 	}
 
 	if err = uvm.startExternalGcsListener(ctx); err != nil {

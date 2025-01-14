@@ -3,8 +3,8 @@ package images
 import (
 	"fmt"
 
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/platforms"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/platforms"
 )
 
 const (
@@ -26,5 +26,5 @@ func SnapshotterFromPlatform(platform string) (string, error) {
 		return SnapshotterLinux, nil
 	default:
 	}
-	return "", fmt.Errorf("unknown platform os %q: %v", p.OS, errdefs.ErrInvalidArgument)
+	return "", fmt.Errorf("unknown platform os %q: %w", p.OS, errdefs.ErrInvalidArgument)
 }

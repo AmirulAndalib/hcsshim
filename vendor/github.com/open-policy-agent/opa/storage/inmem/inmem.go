@@ -19,25 +19,53 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/internal/merge"
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/util"
 )
 
 // New returns an empty in-memory store.
 func New() storage.Store {
-	return &store{
-		data:     map[string]interface{}{},
-		triggers: map[*handle]storage.TriggerConfig{},
-		policies: map[string][]byte{},
+	return NewWithOpts()
+}
+
+// NewWithOpts returns an empty in-memory store, with extra options passed.
+func NewWithOpts(opts ...Opt) storage.Store {
+	s := &store{
+		triggers:              map[*handle]storage.TriggerConfig{},
+		policies:              map[string][]byte{},
+		roundTripOnWrite:      true,
+		returnASTValuesOnRead: false,
 	}
+
+	for _, opt := range opts {
+		opt(s)
+	}
+
+	if s.returnASTValuesOnRead {
+		s.data = ast.NewObject()
+	} else {
+		s.data = map[string]interface{}{}
+	}
+
+	return s
 }
 
 // NewFromObject returns a new in-memory store from the supplied data object.
 func NewFromObject(data map[string]interface{}) storage.Store {
-	db := New()
+	return NewFromObjectWithOpts(data)
+}
+
+// NewFromObjectWithOpts returns a new in-memory store from the supplied data object, with the
+// options passed.
+func NewFromObjectWithOpts(data map[string]interface{}, opts ...Opt) storage.Store {
+	db := NewWithOpts(opts...)
 	ctx := context.Background()
 	txn, err := db.NewTransaction(ctx, storage.WriteParams)
 	if err != nil {
@@ -55,21 +83,36 @@ func NewFromObject(data map[string]interface{}) storage.Store {
 // NewFromReader returns a new in-memory store from a reader that produces a
 // JSON serialized object. This function is for test purposes.
 func NewFromReader(r io.Reader) storage.Store {
+	return NewFromReaderWithOpts(r)
+}
+
+// NewFromReader returns a new in-memory store from a reader that produces a
+// JSON serialized object, with extra options. This function is for test purposes.
+func NewFromReaderWithOpts(r io.Reader, opts ...Opt) storage.Store {
 	d := util.NewJSONDecoder(r)
 	var data map[string]interface{}
 	if err := d.Decode(&data); err != nil {
 		panic(err)
 	}
-	return NewFromObject(data)
+	return NewFromObjectWithOpts(data, opts...)
 }
 
 type store struct {
 	rmu      sync.RWMutex                      // reader-writer lock
 	wmu      sync.Mutex                        // writer lock
 	xid      uint64                            // last generated transaction id
-	data     map[string]interface{}            // raw data
+	data     interface{}                       // raw or AST data
 	policies map[string][]byte                 // raw policies
 	triggers map[*handle]storage.TriggerConfig // registered triggers
+
+	// roundTripOnWrite, if true, means that every call to Write round trips the
+	// data through JSON before adding the data to the store. Defaults to true.
+	roundTripOnWrite bool
+
+	// returnASTValuesOnRead, if true, means that the store will eagerly convert data to AST values,
+	// and return them on Read.
+	// FIXME: naming(?)
+	returnASTValuesOnRead bool
 }
 
 type handle struct {
@@ -78,10 +121,10 @@ type handle struct {
 
 func (db *store) NewTransaction(_ context.Context, params ...storage.TransactionParams) (storage.Transaction, error) {
 	var write bool
-	var context *storage.Context
+	var ctx *storage.Context
 	if len(params) > 0 {
 		write = params[0].Write
-		context = params[0].Context
+		ctx = params[0].Context
 	}
 	xid := atomic.AddUint64(&db.xid, uint64(1))
 	if write {
@@ -89,13 +132,14 @@ func (db *store) NewTransaction(_ context.Context, params ...storage.Transaction
 	} else {
 		db.rmu.RLock()
 	}
-	return newTransaction(xid, write, context, db), nil
+	return newTransaction(xid, write, ctx, db), nil
 }
 
 // Truncate implements the storage.Store interface. This method must be called within a transaction.
-func (db *store) Truncate(ctx context.Context, txn storage.Transaction, _ storage.TransactionParams, it storage.Iterator) error {
+func (db *store) Truncate(ctx context.Context, txn storage.Transaction, params storage.TransactionParams, it storage.Iterator) error {
 	var update *storage.Update
 	var err error
+	mergedData := map[string]interface{}{}
 
 	underlying, err := db.underlying(txn)
 	if err != nil {
@@ -109,57 +153,34 @@ func (db *store) Truncate(ctx context.Context, txn storage.Transaction, _ storag
 		}
 
 		if update.IsPolicy {
-			err = underlying.UpsertPolicy(update.Path.String(), update.Value)
+			err = underlying.UpsertPolicy(strings.TrimLeft(update.Path.String(), "/"), update.Value)
 			if err != nil {
 				return err
 			}
 		} else {
-			if len(update.Path) > 0 {
-				var obj interface{}
-				err = util.Unmarshal(update.Value, &obj)
+			var value interface{}
+			err = util.Unmarshal(update.Value, &value)
+			if err != nil {
+				return err
+			}
+
+			var key []string
+			dirpath := strings.TrimLeft(update.Path.String(), "/")
+			if len(dirpath) > 0 {
+				key = strings.Split(dirpath, "/")
+			}
+
+			if value != nil {
+				obj, err := mktree(key, value)
 				if err != nil {
 					return err
 				}
 
-				_, err := underlying.Read(update.Path[:len(update.Path)-1])
-				if err != nil {
-					if !storage.IsNotFound(err) {
-						return err
-					}
-
-					if err := storage.MakeDir(ctx, db, txn, update.Path[:len(update.Path)-1]); err != nil {
-						return err
-					}
+				merged, ok := merge.InterfaceMaps(mergedData, obj)
+				if !ok {
+					return fmt.Errorf("failed to insert data file from path %s", filepath.Join(key...))
 				}
-
-				err = underlying.Write(storage.AddOp, update.Path, obj)
-				if err != nil {
-					return err
-				}
-			} else {
-				// write operation at root path
-
-				var val map[string]interface{}
-				err := util.Unmarshal(update.Value, &val)
-				if err != nil {
-					return invalidPatchError(rootMustBeObjectMsg)
-				}
-
-				for k := range val {
-					newPath, ok := storage.ParsePathEscaped("/" + k)
-					if !ok {
-						return fmt.Errorf("storage path invalid: %v", newPath)
-					}
-
-					if err := storage.MakeDir(ctx, db, txn, newPath[:len(newPath)-1]); err != nil {
-						return err
-					}
-
-					err = underlying.Write(storage.AddOp, newPath, val[k])
-					if err != nil {
-						return err
-					}
-				}
+				mergedData = merged
 			}
 		}
 	}
@@ -168,6 +189,32 @@ func (db *store) Truncate(ctx context.Context, txn storage.Transaction, _ storag
 		return err
 	}
 
+	// For backwards compatibility, check if `RootOverwrite` was configured.
+	if params.RootOverwrite {
+		newPath, ok := storage.ParsePathEscaped("/")
+		if !ok {
+			return fmt.Errorf("storage path invalid: %v", newPath)
+		}
+		return underlying.Write(storage.AddOp, newPath, mergedData)
+	}
+
+	for _, root := range params.BasePaths {
+		newPath, ok := storage.ParsePathEscaped("/" + root)
+		if !ok {
+			return fmt.Errorf("storage path invalid: %v", newPath)
+		}
+
+		if value, ok := lookup(newPath, mergedData); ok {
+			if len(newPath) > 0 {
+				if err := storage.MakeDir(ctx, db, txn, newPath[:len(newPath)-1]); err != nil {
+					return err
+				}
+			}
+			if err := underlying.Write(storage.AddOp, newPath, value); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -180,7 +227,7 @@ func (db *store) Commit(ctx context.Context, txn storage.Transaction) error {
 		db.rmu.Lock()
 		event := underlying.Commit()
 		db.runOnCommitTriggers(ctx, txn, event)
-		// Mark the transaction stale after executing triggers so they can
+		// Mark the transaction stale after executing triggers, so they can
 		// perform store operations if needed.
 		underlying.stale = true
 		db.rmu.Unlock()
@@ -260,7 +307,13 @@ func (db *store) Read(_ context.Context, txn storage.Transaction, path storage.P
 	if err != nil {
 		return nil, err
 	}
-	return underlying.Read(path)
+
+	v, err := underlying.Read(path)
+	if err != nil {
+		return nil, err
+	}
+
+	return v, nil
 }
 
 func (db *store) Write(_ context.Context, txn storage.Transaction, op storage.PatchOp, path storage.Path, value interface{}) error {
@@ -269,8 +322,10 @@ func (db *store) Write(_ context.Context, txn storage.Transaction, op storage.Pa
 		return err
 	}
 	val := util.Reference(value)
-	if err := util.RoundTrip(val); err != nil {
-		return err
+	if db.roundTripOnWrite {
+		if err := util.RoundTrip(val); err != nil {
+			return err
+		}
 	}
 	return underlying.Write(op, path, *val)
 }
@@ -290,9 +345,43 @@ func (h *handle) Unregister(_ context.Context, txn storage.Transaction) {
 }
 
 func (db *store) runOnCommitTriggers(ctx context.Context, txn storage.Transaction, event storage.TriggerEvent) {
+	if db.returnASTValuesOnRead && len(db.triggers) > 0 {
+		// FIXME: Not very performant for large data.
+
+		dataEvents := make([]storage.DataEvent, 0, len(event.Data))
+
+		for _, dataEvent := range event.Data {
+			if astData, ok := dataEvent.Data.(ast.Value); ok {
+				jsn, err := ast.ValueToInterface(astData, illegalResolver{})
+				if err != nil {
+					panic(err)
+				}
+				dataEvents = append(dataEvents, storage.DataEvent{
+					Path:    dataEvent.Path,
+					Data:    jsn,
+					Removed: dataEvent.Removed,
+				})
+			} else {
+				dataEvents = append(dataEvents, dataEvent)
+			}
+		}
+
+		event = storage.TriggerEvent{
+			Policy:  event.Policy,
+			Data:    dataEvents,
+			Context: event.Context,
+		}
+	}
+
 	for _, t := range db.triggers {
 		t.OnCommit(ctx, txn, event)
 	}
+}
+
+type illegalResolver struct{}
+
+func (illegalResolver) Resolve(ref ast.Ref) (interface{}, error) {
+	return nil, fmt.Errorf("illegal value: %v", ref)
 }
 
 func (db *store) underlying(txn storage.Transaction) (*transaction, error) {
@@ -326,4 +415,44 @@ func invalidPatchError(f string, a ...interface{}) *storage.Error {
 		Code:    storage.InvalidPatchErr,
 		Message: fmt.Sprintf(f, a...),
 	}
+}
+
+func mktree(path []string, value interface{}) (map[string]interface{}, error) {
+	if len(path) == 0 {
+		// For 0 length path the value is the full tree.
+		obj, ok := value.(map[string]interface{})
+		if !ok {
+			return nil, invalidPatchError(rootMustBeObjectMsg)
+		}
+		return obj, nil
+	}
+
+	dir := map[string]interface{}{}
+	for i := len(path) - 1; i > 0; i-- {
+		dir[path[i]] = value
+		value = dir
+		dir = map[string]interface{}{}
+	}
+	dir[path[0]] = value
+
+	return dir, nil
+}
+
+func lookup(path storage.Path, data map[string]interface{}) (interface{}, bool) {
+	if len(path) == 0 {
+		return data, true
+	}
+	for i := 0; i < len(path)-1; i++ {
+		value, ok := data[path[i]]
+		if !ok {
+			return nil, false
+		}
+		obj, ok := value.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		data = obj
+	}
+	value, ok := data[path[len(path)-1]]
+	return value, ok
 }

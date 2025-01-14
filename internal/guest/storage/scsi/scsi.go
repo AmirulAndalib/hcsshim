@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"go.opencensus.io/trace"
 	"golang.org/x/sys/unix"
 
@@ -34,11 +35,13 @@ import (
 var (
 	osMkdirAll  = os.MkdirAll
 	osRemoveAll = os.RemoveAll
+	osSymlink   = os.Symlink
 	unixMount   = unix.Mount
 
 	// mock functions for testing getDevicePath
 	osReadDir = os.ReadDir
 	osStat    = os.Stat
+	osOpen    = os.Open
 
 	// getDevicePath is stubbed to make testing `Mount` easier.
 	getDevicePath = GetDevicePath
@@ -112,6 +115,7 @@ type Config struct {
 	VerityInfo       *guestresource.DeviceVerityInfo
 	EnsureFilesystem bool
 	Filesystem       string
+	BlockDev         bool
 }
 
 // Mount creates a mount from the SCSI device on `controller` index `lun` to
@@ -163,6 +167,19 @@ func Mount(
 		}
 	}
 
+	// create and symlink block device mount target
+	if config.BlockDev {
+		parent := filepath.Dir(target)
+		if err := osMkdirAll(parent, 0700); err != nil {
+			return err
+		}
+		log.G(ctx).WithFields(logrus.Fields{
+			"source": source,
+			"target": target,
+		}).Trace("creating block device symlink")
+		return osSymlink(source, target)
+	}
+
 	if err := osMkdirAll(target, 0700); err != nil {
 		return err
 	}
@@ -202,7 +219,7 @@ func Mount(
 			// TODO (ambarve): add better retry logic, SCSI mounts sometimes return ENONENT or
 			// ENXIO error if we try to open those devices immediately after mount. retry after a
 			// few milliseconds.
-			log.G(ctx).WithError(err).Trace("get device filesystem failed, retrying in 500ms")
+			log.G(ctx).WithError(err).Debug("get device filesystem failed, retrying in 500ms")
 			time.Sleep(500 * time.Millisecond)
 			if deviceFS, err = _getDeviceFsType(source); err != nil {
 				if config.Filesystem == "" || !errors.Is(err, ErrUnknownFilesystem) {
@@ -279,6 +296,15 @@ func Unmount(
 		trace.Int64Attribute("lun", int64(lun)),
 		trace.Int64Attribute("partition", int64(partition)),
 		trace.StringAttribute("target", target))
+
+	// skip unmount logic for block devices, since they are just symlinks
+	if config.BlockDev {
+		log.G(ctx).WithField("target", target).Trace("removing block device symlink")
+		if err := osRemoveAll(target); err != nil {
+			return fmt.Errorf("failed to remove symlink: %w", err)
+		}
+		return nil
+	}
 
 	// unmount target
 	if err := storageUnmountPath(ctx, target, true); err != nil {
@@ -379,7 +405,8 @@ func GetDevicePath(ctx context.Context, controller, lun uint8, partition uint64)
 	// devicePath can take some time before its actually available under
 	// `/dev/sd*`. Retry while we wait for it to show up.
 	for {
-		if _, err := osStat(devicePath); err != nil {
+		f, err := osOpen(devicePath)
+		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, unix.ENXIO) {
 				select {
 				case <-ctx.Done():
@@ -391,6 +418,9 @@ func GetDevicePath(ctx context.Context, controller, lun uint8, partition uint64)
 				}
 			}
 			return "", err
+		}
+		if err := f.Close(); err != nil {
+			log.G(ctx).WithError(err).Warnf("failed to close file: %s", devicePath)
 		}
 		break
 	}

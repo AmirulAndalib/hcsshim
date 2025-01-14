@@ -119,9 +119,12 @@ The delete command will be executed in the container's bundle as its cwd.
 		if err := winapi.NetUserDel(
 			"",
 			username,
-		); err != nil && err != winapi.NERR_UserNotFound {
+		); err != nil && !errors.Is(err, winapi.NERR_UserNotFound) {
 			fmt.Fprintf(os.Stderr, "failed to delete user %q: %v", username, err)
 		}
+
+		// TODO(ambarve):
+		// correctly handle cleanup of cimfs layers in case of shim process crash here.
 
 		if data, err := proto.Marshal(&task.DeleteResponse{
 			ExitedAt:   timestamppb.New(time.Now()),

@@ -21,6 +21,7 @@ import (
 	"github.com/Microsoft/hcsshim/internal/hcs/schema1"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/jobobject"
+	"github.com/Microsoft/hcsshim/internal/layers"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/queue"
 	"github.com/Microsoft/hcsshim/internal/resources"
@@ -28,11 +29,6 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"golang.org/x/sys/windows"
-)
-
-var (
-	fileBindingSupport   bool
-	checkBindSupportOnce sync.Once
 )
 
 const (
@@ -97,8 +93,12 @@ func newJobContainer(id string, s *specs.Spec) *JobContainer {
 	}
 }
 
+type CreateOptions struct {
+	WCOWLayers layers.WCOWLayers
+}
+
 // Create creates a new JobContainer from the OCI runtime spec `s`.
-func Create(ctx context.Context, id string, s *specs.Spec) (_ cow.Container, _ *resources.Resources, err error) {
+func Create(ctx context.Context, id string, s *specs.Spec, createOpts CreateOptions) (_ cow.Container, _ *resources.Resources, err error) {
 	log.G(ctx).WithField("id", id).Debug("Creating job container")
 
 	if s == nil {
@@ -116,12 +116,12 @@ func Create(ctx context.Context, id string, s *specs.Spec) (_ cow.Container, _ *
 	container := newJobContainer(id, s)
 
 	// Create the job object all processes will run in.
-	options := &jobobject.Options{
+	jobOpts := &jobobject.Options{
 		Name:             fmt.Sprintf(jobContainerNameFmt, id),
 		Notifications:    true,
 		EnableIOTracking: true,
 	}
-	container.job, err = jobobject.Create(ctx, options)
+	container.job, err = jobobject.Create(ctx, jobOpts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create job object: %w", err)
 	}
@@ -181,18 +181,11 @@ func Create(ctx context.Context, id string, s *specs.Spec) (_ cow.Container, _ *
 	// show up at beforehand as you would need to know the containers ID before you launched it. Now that the
 	// rootfs location can be static, a user can easily supply C:\hpc\rest\of\path as their work dir and still
 	// supply anything outside of C:\hpc if they want another location on the host.
-	checkBindSupportOnce.Do(func() {
-		bindDLL := `C:\windows\system32\bindfltapi.dll`
-		if _, err := os.Stat(bindDLL); err == nil {
-			fileBindingSupport = true
-		}
-	})
-
 	var closer resources.ResourceCloser
-	if fileBindingSupport {
-		closer, err = container.bindSetup(ctx, s)
+	if FileBindingSupported() {
+		closer, err = container.bindSetup(ctx, s, createOpts)
 	} else {
-		closer, err = container.fallbackSetup(ctx, s)
+		closer, err = container.fallbackSetup(ctx, s, createOpts)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -254,7 +247,7 @@ func (c *JobContainer) CreateProcess(ctx context.Context, config interface{}) (_
 		// If the working directory was changed, that means the user supplied %CONTAINER_SANDBOX_MOUNT_POINT%\\my\dir or something similar.
 		// In that case there's nothing left to do, as we don't want to join it with the mount point again.. If it *wasn't* changed, and there's
 		// no bindflt support then we need to join it with the mount point, as it's some normal path.
-		if !changed && !fileBindingSupport {
+		if !changed && !FileBindingSupported() {
 			workDir = filepath.Join(c.rootfsLocation, removeDriveLetter(workDir))
 		}
 	}
@@ -335,7 +328,7 @@ func (c *JobContainer) CreateProcess(ctx context.Context, config interface{}) (_
 	// (cmd in this case) after launch can now see C:\<rootfslocation> as it's in the silo. We could
 	// also add a new mode/flag for the shim where it's just a dummy process launcher, so we can invoke
 	// the shim instead of cmd and have more control over things.
-	if fileBindingSupport {
+	if FileBindingSupported() {
 		commandLine = "cmd /c " + commandLine
 	}
 
@@ -658,7 +651,7 @@ func (c *JobContainer) pollJobMsgs(ctx context.Context) {
 		if err != nil {
 			// Queues closed or we somehow aren't registered to receive notifications. There won't be
 			// any notifications arriving so we're safe to return.
-			if err == queue.ErrQueueClosed || err == jobobject.ErrNotRegistered {
+			if errors.Is(err, queue.ErrQueueClosed) || errors.Is(err, jobobject.ErrNotRegistered) {
 				return
 			}
 			log.G(ctx).WithError(err).Warn("error while polling for job container notification")
@@ -765,13 +758,13 @@ func (c *JobContainer) replaceWithMountPoint(str string) (string, bool) {
 	return newStr, str != newStr
 }
 
-func (c *JobContainer) bindSetup(ctx context.Context, s *specs.Spec) (_ resources.ResourceCloser, err error) {
+func (c *JobContainer) bindSetup(ctx context.Context, s *specs.Spec, opts CreateOptions) (_ resources.ResourceCloser, err error) {
 	// Must be upgraded to a silo so we can get per silo bindings for the container.
 	if err := c.job.PromoteToSilo(); err != nil {
 		return nil, err
 	}
 	// Union the container layers.
-	closer, err := c.mountLayers(ctx, c.id, s, "")
+	closer, err := c.mountLayers(ctx, c.id, s, opts.WCOWLayers, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to mount container layers: %w", err)
 	}
@@ -798,12 +791,12 @@ func (c *JobContainer) bindSetup(ctx context.Context, s *specs.Spec) (_ resource
 
 // This handles the fallback case where bind mounting isn't available on the machine. This mounts the
 // container layers on the host and sets up any mounts present in the OCI runtime spec.
-func (c *JobContainer) fallbackSetup(ctx context.Context, s *specs.Spec) (_ resources.ResourceCloser, err error) {
+func (c *JobContainer) fallbackSetup(ctx context.Context, s *specs.Spec, opts CreateOptions) (_ resources.ResourceCloser, err error) {
 	rootfsLocation := fmt.Sprintf(fallbackRootfsFormat, c.id)
 	if loc := customRootfsLocation(s.Annotations); loc != "" {
 		rootfsLocation = filepath.Join(loc, c.id)
 	}
-	closer, err := c.mountLayers(ctx, c.id, s, rootfsLocation)
+	closer, err := c.mountLayers(ctx, c.id, s, opts.WCOWLayers, rootfsLocation)
 	if err != nil {
 		return nil, fmt.Errorf("failed to mount container layers: %w", err)
 	}

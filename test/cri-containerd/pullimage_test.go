@@ -46,7 +46,7 @@ func Test_PullImageTimestamps(t *testing.T) {
 	pullRequiredImages(t, []string{imageWindowsNanoserverTestImage})
 	defer removeImages(t, []string{imageWindowsNanoserverTestImage})
 
-	sandboxRequest := getRunPodSandboxRequest(t, wcowHypervisor18362RuntimeHandler)
+	sandboxRequest := getRunPodSandboxRequest(t, wcowHypervisorRuntimeHandler)
 
 	podID := runPodSandbox(t, client, ctx, sandboxRequest)
 	defer removePodSandbox(t, client, ctx, podID)
@@ -103,12 +103,4 @@ func Test_PullImageTimestamps(t *testing.T) {
 	if startTimestamp.Before(testdirTimestamp) || startTimestamp.Before(fakelinkTimestamp) {
 		t.Fatalf("Timestamps not in order. startTimestamp should be less than testdirTimestamp and fakelinkTimestamp")
 	}
-}
-
-func Test_PullImageUnorderedTar(t *testing.T) {
-	requireFeatures(t, featureLCOW)
-
-	// This is a very minimal hand crafted image so it can't run a container.  We just
-	// want to test if pulling this image succeeds.
-	pullRequiredLCOWImages(t, []string{imageLinuxUnorderedTar})
 }

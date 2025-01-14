@@ -5,9 +5,12 @@ package oci
 import (
 	"context"
 	"errors"
+	"maps"
 	"strconv"
 
 	runhcsopts "github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
+	iannotations "github.com/Microsoft/hcsshim/internal/annotations"
+	"github.com/Microsoft/hcsshim/internal/devices"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 	"github.com/Microsoft/hcsshim/pkg/annotations"
@@ -21,8 +24,8 @@ import (
 // not found searches `s` for the Windows CPU section. If neither are found
 // returns `def`.
 func ParseAnnotationsCPUCount(ctx context.Context, s *specs.Spec, annotation string, def int32) int32 {
-	if m := parseAnnotationsUint64(ctx, s.Annotations, annotation, 0); m != 0 {
-		return int32(m)
+	if m := ParseAnnotationsInt32(ctx, s.Annotations, annotation, 0); m != 0 {
+		return m
 	}
 	if s.Windows != nil &&
 		s.Windows.Resources != nil &&
@@ -38,8 +41,8 @@ func ParseAnnotationsCPUCount(ctx context.Context, s *specs.Spec, annotation str
 // not found searches `s` for the Windows CPU section. If neither are found
 // returns `def`.
 func ParseAnnotationsCPULimit(ctx context.Context, s *specs.Spec, annotation string, def int32) int32 {
-	if m := parseAnnotationsUint64(ctx, s.Annotations, annotation, 0); m != 0 {
-		return int32(m)
+	if m := ParseAnnotationsInt32(ctx, s.Annotations, annotation, 0); m != 0 {
+		return m
 	}
 	if s.Windows != nil &&
 		s.Windows.Resources != nil &&
@@ -55,8 +58,8 @@ func ParseAnnotationsCPULimit(ctx context.Context, s *specs.Spec, annotation str
 // not found searches `s` for the Windows CPU section. If neither are found
 // returns `def`.
 func ParseAnnotationsCPUWeight(ctx context.Context, s *specs.Spec, annotation string, def int32) int32 {
-	if m := parseAnnotationsUint64(ctx, s.Annotations, annotation, 0); m != 0 {
-		return int32(m)
+	if m := ParseAnnotationsInt32(ctx, s.Annotations, annotation, 0); m != 0 {
+		return m
 	}
 	if s.Windows != nil &&
 		s.Windows.Resources != nil &&
@@ -72,8 +75,8 @@ func ParseAnnotationsCPUWeight(ctx context.Context, s *specs.Spec, annotation st
 // annotation. If not found searches `s` for the Windows Storage section. If
 // neither are found returns `def`.
 func ParseAnnotationsStorageIops(ctx context.Context, s *specs.Spec, annotation string, def int32) int32 {
-	if m := parseAnnotationsUint64(ctx, s.Annotations, annotation, 0); m != 0 {
-		return int32(m)
+	if m := ParseAnnotationsInt32(ctx, s.Annotations, annotation, 0); m != 0 {
+		return m
 	}
 	if s.Windows != nil &&
 		s.Windows.Resources != nil &&
@@ -89,8 +92,8 @@ func ParseAnnotationsStorageIops(ctx context.Context, s *specs.Spec, annotation 
 // If not found searches `s` for the Windows Storage section. If neither are
 // found returns `def`.
 func ParseAnnotationsStorageBps(ctx context.Context, s *specs.Spec, annotation string, def int32) int32 {
-	if m := parseAnnotationsUint64(ctx, s.Annotations, annotation, 0); m != 0 {
-		return int32(m)
+	if m := ParseAnnotationsInt32(ctx, s.Annotations, annotation, 0); m != 0 {
+		return m
 	}
 	if s.Windows != nil &&
 		s.Windows.Resources != nil &&
@@ -108,7 +111,7 @@ func ParseAnnotationsStorageBps(ctx context.Context, s *specs.Spec, annotation s
 //
 // Note: The returned value is in `MB`.
 func ParseAnnotationsMemory(ctx context.Context, s *specs.Spec, annotation string, def uint64) uint64 {
-	if m := parseAnnotationsUint64(ctx, s.Annotations, annotation, 0); m != 0 {
+	if m := ParseAnnotationsUint64(ctx, s.Annotations, annotation, 0); m != 0 {
 		return m
 	}
 	if s.Windows != nil &&
@@ -143,7 +146,7 @@ func parseAnnotationsPreferredRootFSType(ctx context.Context, a map[string]strin
 // handleAnnotationBootFilesPath handles parsing annotations.BootFilesRootPath and setting
 // implied options from the result.
 func handleAnnotationBootFilesPath(ctx context.Context, a map[string]string, lopts *uvm.OptionsLCOW) {
-	lopts.UpdateBootFilesPath(ctx, parseAnnotationsString(a, annotations.BootFilesRootPath, lopts.BootFilesPath))
+	lopts.UpdateBootFilesPath(ctx, ParseAnnotationsString(a, annotations.BootFilesRootPath, lopts.BootFilesPath))
 }
 
 // handleAnnotationKernelDirectBoot handles parsing annotations.KernelDirectBoot and setting
@@ -156,7 +159,7 @@ func handleAnnotationKernelDirectBoot(ctx context.Context, a map[string]string, 
 }
 
 // handleAnnotationPreferredRootFSType handles parsing annotations.PreferredRootFSType and setting
-// implied options from the result
+// implied options from the result.
 func handleAnnotationPreferredRootFSType(ctx context.Context, a map[string]string, lopts *uvm.OptionsLCOW) {
 	lopts.PreferredRootFSType = parseAnnotationsPreferredRootFSType(ctx, a, annotations.PreferredRootFSType, lopts.PreferredRootFSType)
 	switch lopts.PreferredRootFSType {
@@ -175,8 +178,6 @@ func handleAnnotationFullyPhysicallyBacked(ctx context.Context, a map[string]str
 		options.FullyPhysicallyBacked = ParseAnnotationsBool(ctx, a, annotations.FullyPhysicallyBacked, options.FullyPhysicallyBacked)
 		if options.FullyPhysicallyBacked {
 			options.AllowOvercommit = false
-			options.PreferredRootFSType = uvm.PreferredRootFSTypeInitRd
-			options.RootFSFile = uvm.InitrdFile
 			options.VPMemDeviceCount = 0
 		}
 	case *uvm.OptionsWCOW:
@@ -188,9 +189,9 @@ func handleAnnotationFullyPhysicallyBacked(ctx context.Context, a map[string]str
 }
 
 // handleSecurityPolicy handles parsing SecurityPolicy and NoSecurityHardware and setting
-// implied options from the results. Both LCOW only, not WCOW
+// implied options from the results. Both LCOW only, not WCOW.
 func handleSecurityPolicy(ctx context.Context, a map[string]string, lopts *uvm.OptionsLCOW) {
-	lopts.SecurityPolicy = parseAnnotationsString(a, annotations.SecurityPolicy, lopts.SecurityPolicy)
+	lopts.SecurityPolicy = ParseAnnotationsString(a, annotations.SecurityPolicy, lopts.SecurityPolicy)
 	// allow actual isolated boot etc to be ignored if we have no hardware. Required for dev
 	// this is not a security issue as the attestation will fail without a genuine report
 	noSecurityHardware := ParseAnnotationsBool(ctx, a, annotations.NoSecurityHardware, false)
@@ -205,9 +206,19 @@ func handleSecurityPolicy(ctx context.Context, a map[string]string, lopts *uvm.O
 		// set the default GuestState filename.
 		lopts.GuestStateFile = uvm.GuestStateFile
 		lopts.KernelBootOptions = ""
-		lopts.PreferredRootFSType = uvm.PreferredRootFSTypeNA
 		lopts.AllowOvercommit = false
 		lopts.SecurityPolicyEnabled = true
+
+		// There are two possible ways to boot SNP mode. Either kernelinitrd.vmgs which consists of kernel plus initrd.cpio.gz
+		// Or a kernel.vmgs file (without an initrd) plus a separate vhd file which is dmverity protected via a hash tree
+		// appended to rootfs ext4 filesystem.
+		// We only currently support using the dmverity scheme. Note that the dmverity file name may be explicitly specified via
+		// an annotation this is deliberately not the same annotation as the non-SNP rootfs vhd file.
+		// The default behavior is to use kernel.vmgs and a rootfs-verity.vhd file with Merkle tree appended to ext4 filesystem.
+		lopts.PreferredRootFSType = uvm.PreferredRootFSTypeNA
+		lopts.RootFSFile = ""
+		lopts.DmVerityRootFsVhd = uvm.DefaultDmVerityRootfsVhd
+		lopts.DmVerityMode = true
 	}
 
 	if len(lopts.SecurityPolicy) > 0 {
@@ -216,12 +227,34 @@ func handleSecurityPolicy(ctx context.Context, a map[string]string, lopts *uvm.O
 	}
 }
 
-// sets options common to both WCOW and LCOW from annotations
+func parseDevices(ctx context.Context, specWindows *specs.Windows) []uvm.VPCIDeviceID {
+	if specWindows == nil || specWindows.Devices == nil {
+		return nil
+	}
+	extraDevices := []uvm.VPCIDeviceID{}
+	for _, d := range specWindows.Devices {
+		pciID, index := devices.GetDeviceInfoFromPath(d.ID)
+		if uvm.IsValidDeviceType(d.IDType) {
+			key := uvm.NewVPCIDeviceID(pciID, index)
+			extraDevices = append(extraDevices, key)
+		} else {
+			log.G(ctx).WithFields(logrus.Fields{
+				"device": d,
+			}).Warnf("device type %s invalid, skipping", d.IDType)
+		}
+	}
+	// nil out the devices on the spec so that they aren't re-added to the
+	// pause container.
+	specWindows.Devices = nil
+	return extraDevices
+}
+
+// sets options common to both WCOW and LCOW from annotations.
 func specToUVMCreateOptionsCommon(ctx context.Context, opts *uvm.Options, s *specs.Spec) {
 	opts.MemorySizeInMB = ParseAnnotationsMemory(ctx, s, annotations.MemorySizeInMB, opts.MemorySizeInMB)
-	opts.LowMMIOGapInMB = parseAnnotationsUint64(ctx, s.Annotations, annotations.MemoryLowMMIOGapInMB, opts.LowMMIOGapInMB)
-	opts.HighMMIOBaseInMB = parseAnnotationsUint64(ctx, s.Annotations, annotations.MemoryHighMMIOBaseInMB, opts.HighMMIOBaseInMB)
-	opts.HighMMIOGapInMB = parseAnnotationsUint64(ctx, s.Annotations, annotations.MemoryHighMMIOGapInMB, opts.HighMMIOGapInMB)
+	opts.LowMMIOGapInMB = ParseAnnotationsUint64(ctx, s.Annotations, annotations.MemoryLowMMIOGapInMB, opts.LowMMIOGapInMB)
+	opts.HighMMIOBaseInMB = ParseAnnotationsUint64(ctx, s.Annotations, annotations.MemoryHighMMIOBaseInMB, opts.HighMMIOBaseInMB)
+	opts.HighMMIOGapInMB = ParseAnnotationsUint64(ctx, s.Annotations, annotations.MemoryHighMMIOGapInMB, opts.HighMMIOGapInMB)
 	opts.AllowOvercommit = ParseAnnotationsBool(ctx, s.Annotations, annotations.AllowOvercommit, opts.AllowOvercommit)
 	opts.EnableDeferredCommit = ParseAnnotationsBool(ctx, s.Annotations, annotations.EnableDeferredCommit, opts.EnableDeferredCommit)
 	opts.ProcessorCount = ParseAnnotationsCPUCount(ctx, s, annotations.ProcessorCount, opts.ProcessorCount)
@@ -229,11 +262,22 @@ func specToUVMCreateOptionsCommon(ctx context.Context, opts *uvm.Options, s *spe
 	opts.ProcessorWeight = ParseAnnotationsCPUWeight(ctx, s, annotations.ProcessorWeight, opts.ProcessorWeight)
 	opts.StorageQoSBandwidthMaximum = ParseAnnotationsStorageBps(ctx, s, annotations.StorageQoSBandwidthMaximum, opts.StorageQoSBandwidthMaximum)
 	opts.StorageQoSIopsMaximum = ParseAnnotationsStorageIops(ctx, s, annotations.StorageQoSIopsMaximum, opts.StorageQoSIopsMaximum)
-	opts.CPUGroupID = parseAnnotationsString(s.Annotations, annotations.CPUGroupID, opts.CPUGroupID)
-	opts.NetworkConfigProxy = parseAnnotationsString(s.Annotations, annotations.NetworkConfigProxy, opts.NetworkConfigProxy)
-	opts.ProcessDumpLocation = parseAnnotationsString(s.Annotations, annotations.ContainerProcessDumpLocation, opts.ProcessDumpLocation)
+	opts.CPUGroupID = ParseAnnotationsString(s.Annotations, annotations.CPUGroupID, opts.CPUGroupID)
+	opts.NetworkConfigProxy = ParseAnnotationsString(s.Annotations, annotations.NetworkConfigProxy, opts.NetworkConfigProxy)
+	opts.ProcessDumpLocation = ParseAnnotationsString(s.Annotations, annotations.ContainerProcessDumpLocation, opts.ProcessDumpLocation)
 	opts.NoWritableFileShares = ParseAnnotationsBool(ctx, s.Annotations, annotations.DisableWritableFileShares, opts.NoWritableFileShares)
-	opts.DumpDirectoryPath = parseAnnotationsString(s.Annotations, annotations.DumpDirectoryPath, opts.DumpDirectoryPath)
+	opts.DumpDirectoryPath = ParseAnnotationsString(s.Annotations, annotations.DumpDirectoryPath, opts.DumpDirectoryPath)
+	opts.MaxProcessorsPerNumaNode = ParseAnnotationsUint32(ctx, s.Annotations, annotations.NumaMaximumProcessorsPerNode, opts.MaxProcessorsPerNumaNode)
+	opts.MaxSizePerNode = ParseAnnotationsUint64(ctx, s.Annotations, annotations.NumaMaximumSizePerNode, opts.MaxSizePerNode)
+	opts.PreferredPhysicalNumaNodes = ParseAnnotationCommaSeparatedUint32(ctx, s.Annotations, annotations.NumaPreferredPhysicalNodes,
+		opts.PreferredPhysicalNumaNodes)
+	opts.NumaMappedPhysicalNodes = ParseAnnotationCommaSeparatedUint32(ctx, s.Annotations, annotations.NumaMappedPhysicalNodes,
+		opts.NumaMappedPhysicalNodes)
+	opts.NumaProcessorCounts = ParseAnnotationCommaSeparatedUint32(ctx, s.Annotations, annotations.NumaCountOfProcessors,
+		opts.NumaProcessorCounts)
+	opts.NumaMemoryBlocksCounts = ParseAnnotationCommaSeparatedUint64(ctx, s.Annotations, annotations.NumaCountOfMemoryBlocks,
+		opts.NumaMemoryBlocksCounts)
+	maps.Copy(opts.AdditionalHyperVConfig, parseHVSocketServiceTable(ctx, s.Annotations))
 }
 
 // SpecToUVMCreateOpts parses `s` and returns either `*uvm.OptionsLCOW` or
@@ -256,32 +300,38 @@ func SpecToUVMCreateOpts(ctx context.Context, s *specs.Spec, id, owner string) (
 		*/
 
 		lopts.EnableColdDiscardHint = ParseAnnotationsBool(ctx, s.Annotations, annotations.EnableColdDiscardHint, lopts.EnableColdDiscardHint)
-		lopts.VPMemDeviceCount = parseAnnotationsUint32(ctx, s.Annotations, annotations.VPMemCount, lopts.VPMemDeviceCount)
-		lopts.VPMemSizeBytes = parseAnnotationsUint64(ctx, s.Annotations, annotations.VPMemSize, lopts.VPMemSizeBytes)
+		lopts.VPMemDeviceCount = ParseAnnotationsUint32(ctx, s.Annotations, annotations.VPMemCount, lopts.VPMemDeviceCount)
+		lopts.VPMemSizeBytes = ParseAnnotationsUint64(ctx, s.Annotations, annotations.VPMemSize, lopts.VPMemSizeBytes)
 		lopts.VPMemNoMultiMapping = ParseAnnotationsBool(ctx, s.Annotations, annotations.VPMemNoMultiMapping, lopts.VPMemNoMultiMapping)
 		lopts.VPCIEnabled = ParseAnnotationsBool(ctx, s.Annotations, annotations.VPCIEnabled, lopts.VPCIEnabled)
+		lopts.ExtraVSockPorts = ParseAnnotationCommaSeparatedUint32(ctx, s.Annotations, iannotations.ExtraVSockPorts, lopts.ExtraVSockPorts)
 		handleAnnotationBootFilesPath(ctx, s.Annotations, lopts)
 		lopts.EnableScratchEncryption = ParseAnnotationsBool(ctx, s.Annotations, annotations.EncryptedScratchDisk, lopts.EnableScratchEncryption)
-		lopts.SecurityPolicy = parseAnnotationsString(s.Annotations, annotations.SecurityPolicy, lopts.SecurityPolicy)
-		lopts.SecurityPolicyEnforcer = parseAnnotationsString(s.Annotations, annotations.SecurityPolicyEnforcer, lopts.SecurityPolicyEnforcer)
-		lopts.UVMReferenceInfoFile = parseAnnotationsString(s.Annotations, annotations.UVMReferenceInfoFile, lopts.UVMReferenceInfoFile)
-		lopts.KernelBootOptions = parseAnnotationsString(s.Annotations, annotations.KernelBootOptions, lopts.KernelBootOptions)
+		lopts.SecurityPolicy = ParseAnnotationsString(s.Annotations, annotations.SecurityPolicy, lopts.SecurityPolicy)
+		lopts.SecurityPolicyEnforcer = ParseAnnotationsString(s.Annotations, annotations.SecurityPolicyEnforcer, lopts.SecurityPolicyEnforcer)
+		lopts.UVMReferenceInfoFile = ParseAnnotationsString(s.Annotations, annotations.UVMReferenceInfoFile, lopts.UVMReferenceInfoFile)
+		lopts.KernelBootOptions = ParseAnnotationsString(s.Annotations, annotations.KernelBootOptions, lopts.KernelBootOptions)
 		lopts.DisableTimeSyncService = ParseAnnotationsBool(ctx, s.Annotations, annotations.DisableLCOWTimeSyncService, lopts.DisableTimeSyncService)
+		lopts.ConsolePipe = ParseAnnotationsString(s.Annotations, iannotations.UVMConsolePipe, lopts.ConsolePipe)
 		handleAnnotationPreferredRootFSType(ctx, s.Annotations, lopts)
 		handleAnnotationKernelDirectBoot(ctx, s.Annotations, lopts)
-
-		// parsing of FullyPhysicallyBacked needs to go after handling kernel direct boot and
-		// preferred rootfs type since it may overwrite settings created by those
 		handleAnnotationFullyPhysicallyBacked(ctx, s.Annotations, lopts)
 
 		// SecurityPolicy is very sensitive to other settings and will silently change those that are incompatible.
 		// Eg VMPem device count, overridden kernel option cannot be respected.
 		handleSecurityPolicy(ctx, s.Annotations, lopts)
 
-		// override the default GuestState filename if specified
-		lopts.GuestStateFile = parseAnnotationsString(s.Annotations, annotations.GuestStateFile, lopts.GuestStateFile)
+		// override the default GuestState and DmVerityRootFs filenames if specified
+		lopts.GuestStateFile = ParseAnnotationsString(s.Annotations, annotations.GuestStateFile, lopts.GuestStateFile)
+		lopts.DmVerityRootFsVhd = ParseAnnotationsString(s.Annotations, annotations.DmVerityRootFsVhd, lopts.DmVerityRootFsVhd)
+		lopts.DmVerityMode = ParseAnnotationsBool(ctx, s.Annotations, annotations.DmVerityMode, lopts.DmVerityMode)
+		lopts.DmVerityCreateArgs = ParseAnnotationsString(s.Annotations, annotations.DmVerityCreateArgs, lopts.DmVerityCreateArgs)
 		// Set HclEnabled if specified. Else default to a null pointer, which is omitted from the resulting JSON.
 		lopts.HclEnabled = ParseAnnotationsNullableBool(ctx, s.Annotations, annotations.HclEnabled)
+
+		// Add devices on the spec to the UVM's options
+		lopts.AssignedDevices = parseDevices(ctx, s.Windows)
+
 		return lopts, nil
 	} else if IsWCOW(s) {
 		wopts := uvm.NewDefaultOptionsWCOW(id, owner)
@@ -290,6 +340,7 @@ func SpecToUVMCreateOpts(ctx context.Context, s *specs.Spec, id, owner string) (
 		wopts.DisableCompartmentNamespace = ParseAnnotationsBool(ctx, s.Annotations, annotations.DisableCompartmentNamespace, wopts.DisableCompartmentNamespace)
 		wopts.NoDirectMap = ParseAnnotationsBool(ctx, s.Annotations, annotations.VSMBNoDirectMap, wopts.NoDirectMap)
 		wopts.NoInheritHostTimezone = ParseAnnotationsBool(ctx, s.Annotations, annotations.NoInheritHostTimezone, wopts.NoInheritHostTimezone)
+		wopts.AdditionalRegistryKeys = append(wopts.AdditionalRegistryKeys, parseAdditionalRegistryValues(ctx, s.Annotations)...)
 		handleAnnotationFullyPhysicallyBacked(ctx, s.Annotations, wopts)
 		return wopts, nil
 	}
